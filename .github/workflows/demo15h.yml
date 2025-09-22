@@ -1,0 +1,296 @@
+name: demo15h
+
+on:
+  schedule:
+    # ⚠️ Hora en UTC. Ajusta a tu gusto (aquí corre cada día a las 16:00 UTC).
+    - cron: "0 16 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  slot1:
+    name: Slot 1 (~5h)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas requests
+
+      - name: Create runner script
+        shell: bash
+        run: |
+          cat > cron_run_demo.py <<'PY'
+          import os, csv, time, math, requests
+          from datetime import datetime
+          import pandas as pd
+          import ccxt
+
+          PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE","1000"))
+          CSV_PATH   = os.getenv("CSV_PATH","operaciones.csv")
+          RUNTIME_SEC = int(os.getenv("RUNTIME_SEC","17900"))  # ~ 4h 58m
+          SLEEP_SEC   = float(os.getenv("SLEEP_SEC","10"))
+          SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS","BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
+          RISK_AGRESIVO   = float(os.getenv("RISK_AGRESIVO","0.05"))
+          RISK_MODERADO   = float(os.getenv("RISK_MODERADO","0.025"))
+          RISK_CONSERVADOR= float(os.getenv("RISK_CONSERVADOR","0.01"))
+          FEE_TAKER = float(os.getenv("FEE_TAKER","0.001"))
+          SPREAD_BPS= float(os.getenv("SPREAD_BPS","0.0002"))
+          TG_TOKEN = os.getenv("TELEGRAM_TOKEN","")
+          TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID","")
+          SEND_TG  = bool(TG_TOKEN and TG_CHAT)
+
+          def ensure_csv(path):
+              if not os.path.exists(path):
+                  with open(path,"w",newline="",encoding="utf-8") as f:
+                      csv.writer(f).writerow(["fecha","modo","par","accion","precio","qty","pnl","equity"])
+          def append_row(row):
+              with open(CSV_PATH,"a",newline="",encoding="utf-8") as f:
+                  csv.writer(f).writerow(row)
+          def read_df():
+              if not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH)==0:
+                  return pd.DataFrame(columns=["fecha","modo","par","accion","precio","qty","pnl","equity"])
+              try:
+                  df = pd.read_csv(CSV_PATH, parse_dates=["fecha"], on_bad_lines="skip", engine="python")
+              except Exception:
+                  df = pd.read_csv(CSV_PATH, on_bad_lines="skip", engine="python")
+                  if "fecha" in df.columns:
+                      df["fecha"]=pd.to_datetime(df["fecha"],errors="coerce")
+              df.columns=[c.strip().lower() for c in df.columns]
+              if "pnl" in df.columns: df["pnl"]=pd.to_numeric(df["pnl"],errors="coerce").fillna(0.0)
+              if "equity" in df.columns: df["equity"]=pd.to_numeric(df["equity"],errors="coerce")
+              return df.dropna(subset=["fecha"], how="any").sort_values("fecha")
+          def fmt_money(x, d=2):
+              x = float(x); sign = "" if x>=0 else "-"
+              return f"{sign}$ {abs(x):.{d}f}"
+          def send_tg(text):
+              if not SEND_TG: return
+              try:
+                  url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+                  requests.post(url, json={"chat_id": TG_CHAT, "text": text, "parse_mode":"Markdown"}, timeout=15)
+              except Exception: pass
+
+          class LBankFeed:
+              def __init__(self):
+                  self.c = ccxt.lbank({"enableRateLimit": True})
+                  self.mk = None
+              def load(self):
+                  if self.mk is None: self.mk = self.c.load_markets()
+              def valid(self, symbol):
+                  self.load(); return symbol in self.mk
+              def ticker(self, symbol):
+                  try:
+                      t = self.c.fetch_ticker(symbol); time.sleep(0.2)
+                      return {"bid": t.get("bid") or t.get("last"),
+                              "ask": t.get("ask") or t.get("last"),
+                              "last": t.get("last") or t.get("close")}
+                  except Exception: return None
+              def round_price(self, symbol, px):
+                  self.load(); m=self.mk.get(symbol)
+                  if not m: return float(px)
+                  prec = (m.get("precision") or {}).get("price")
+                  if prec is not None: return float(round(px,int(prec)))
+                  tick = (m.get("limits") or {}).get("price",{}).get("min")
+                  if tick: return float(math.floor(px/tick)*tick)
+                  return float(px)
+              def round_amount(self, symbol, amt):
+                  self.load(); m=self.mk.get(symbol)
+                  if not m: return float(amt)
+                  prec = (m.get("precision") or {}).get("amount")
+                  if prec is not None:
+                      val=float(round(amt,int(prec)))
+                      return 0.0 if val<(10**-int(prec)) else val
+                  step=(m.get("limits") or {}).get("amount",{}).get("min")
+                  if step: return float(math.floor(amt/step)*step)
+                  return float(amt)
+              def min_notional(self, symbol):
+                  self.load(); m=self.mk.get(symbol)
+                  return (m.get("limits") or {}).get("cost",{}).get("min")
+
+          def pick_symbols(feed):
+              out=[]
+              for s in SYMBOLS:
+                  if feed.valid(s): out.append(s)
+                  if len(out)>=3: break
+              return out or ["BTC/USDT"]
+
+          def run_once():
+              ensure_csv(CSV_PATH)
+              feed = LBankFeed()
+              symbols = pick_symbols(feed)
+              df = read_df()
+              equity = float(df["equity"].iloc[-1]) if ("equity" in df.columns and not df.empty and pd.notna(df["equity"].iloc[-1])) else PAPER_START_BALANCE
+              t0 = time.time()
+              opens = {}
+              while time.time() - t0 < RUNTIME_SEC:
+                  for sym in symbols:
+                      tk = feed.ticker(sym)
+                      if not tk: continue
+                      bid = tk["bid"] or tk["last"]; ask = tk["ask"] or tk["last"]
+                      if not (bid and ask): continue
+                      last = float(ask)
+                      stakes = {
+                          "agresivo":   max(5.0, equity*0.2*RISK_AGRESIVO),
+                          "moderado":   max(5.0, equity*0.2*RISK_MODERADO),
+                          "conservador":max(5.0, equity*0.2*RISK_CONSERVADOR),
+                      }
+                      for modo, stake in stakes.items():
+                          key=(modo,sym)
+                          if key in opens:
+                              pos=opens[key]
+                              atr=0.004*pos["entry"]
+                              tp=pos["entry"]+1.2*atr
+                              sl=pos["entry"]-1.0*atr
+                              px=float(bid)*(1-SPREAD_BPS)
+                              pnl=(px-pos["entry"])*pos["qty"] - ((pos["entry"]*pos["qty"] + px*pos["qty"])*FEE_TAKER)
+                              if px>=tp or px<=sl or (time.time()-pos["topen"])>60:
+                                  equity += pnl
+                                  append_row([datetime.utcnow().isoformat(), modo, sym, "CERRAR", round(px,6), round(pos["qty"],6), round(pnl,6), round(equity,2)])
+                                  del opens[key]
+                              continue
+                          if int(last)%2==0:
+                              exec_px=feed.round_price(sym, float(ask)*(1+SPREAD_BPS))
+                              qty=stake/exec_px
+                              qty=feed.round_amount(sym, qty)
+                              mn=feed.min_notional(sym) or 0.0
+                              if mn>0 and qty*exec_px<mn:
+                                  need=feed.round_amount(sym, mn/exec_px)
+                                  qty=max(qty,need)
+                              if qty<=0: continue
+                              equity -= exec_px*qty*(1+FEE_TAKER)
+                              opens[key]={"entry":exec_px,"qty":qty,"topen":time.time()}
+                              append_row([datetime.utcnow().isoformat(), modo, sym, "ABRIR", round(exec_px,6), round(qty,6), 0.0, round(equity,2)])
+                  time.sleep(SLEEP_SEC)
+              for key,pos in list(opens.items()):
+                  sym=key[1]
+                  tk=feed.ticker(sym)
+                  px=(tk["bid"] or tk["last"]) if tk else pos["entry"]
+                  pnl=(px-pos["entry"])*pos["qty"] - ((pos["entry"]*pos["qty"] + px*pos["qty"])*FEE_TAKER)
+                  equity_local=equity+pnl
+                  append_row([datetime.utcnow().isoformat(), key[0], sym, "CERRAR", round(px,6), round(pos["qty"],6), round(pnl,6), round(equity_local,2)])
+                  equity=equity_local
+              df2=read_df()
+              tot=float(df2["pnl"].sum()) if "pnl" in df2.columns else 0.0
+              ops=len(df2)
+              wins=int((df2["pnl"]>0).sum()) if "pnl" in df2.columns else 0
+              wr=(wins/ops*100) if ops>0 else 0.0
+              if TG_TOKEN and TG_CHAT:
+                  try:
+                      url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+                      txt=f"📊 *Slot DEMO completado*\\nEquity: *{fmt_money(equity)}*\\nPNL total: *{fmt_money(tot)}*\\nWinrate: *{wr:.2f}%*\\nOps: *{ops}*"
+                      requests.post(url, json={"chat_id":TG_CHAT,"text":txt,"parse_mode":"Markdown"}, timeout=15)
+                  except Exception: pass
+          if __name__=="__main__":
+              run_once()
+          PY
+
+      - name: Prepare env & seed CSV
+        run: |
+          echo "PAPER_START_BALANCE=1000" >> $GITHUB_ENV
+          echo "CSV_PATH=operaciones.csv" >> $GITHUB_ENV
+          echo "RUNTIME_SEC=17900" >> $GITHUB_ENV
+          echo "SLEEP_SEC=10" >> $GITHUB_ENV
+          echo "SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT" >> $GITHUB_ENV
+          echo "RISK_AGRESIVO=0.05" >> $GITHUB_ENV
+          echo "RISK_MODERADO=0.025" >> $GITHUB_ENV
+          echo "RISK_CONSERVADOR=0.01" >> $GITHUB_ENV
+          echo "FEE_TAKER=0.001" >> $GITHUB_ENV
+          echo "SPREAD_BPS=0.0002" >> $GITHUB_ENV
+          if [ -n "${{ secrets.TELEGRAM_TOKEN }}" ]; then echo "TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}" >> $GITHUB_ENV; fi
+          if [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV; fi
+          [ -f operaciones.csv ] || echo "fecha,modo,par,accion,precio,qty,pnl,equity" > operaciones.csv
+
+      - name: Run slot 1
+        run: python cron_run_demo.py
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: ops_slot1
+          path: operaciones.csv
+
+  slot2:
+    name: Slot 2 (~5h)
+    runs-on: ubuntu-latest
+    needs: slot1
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas requests
+      - name: Get CSV from slot1
+        uses: actions/download-artifact@v4
+        with:
+          name: ops_slot1
+          path: .
+      - name: Recreate runner script
+        run: cp cron_run_demo.py cron_run_demo.py || true
+      - name: Prepare env
+        run: |
+          echo "CSV_PATH=operaciones.csv" >> $GITHUB_ENV
+          echo "RUNTIME_SEC=17900" >> $GITHUB_ENV
+          echo "SLEEP_SEC=10" >> $GITHUB_ENV
+          echo "SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT" >> $GITHUB_ENV
+          echo "RISK_AGRESIVO=0.05" >> $GITHUB_ENV
+          echo "RISK_MODERADO=0.025" >> $GITHUB_ENV
+          echo "RISK_CONSERVADOR=0.01" >> $GITHUB_ENV
+          echo "FEE_TAKER=0.001" >> $GITHUB_ENV
+          echo "SPREAD_BPS=0.0002" >> $GITHUB_ENV
+          if [ -n "${{ secrets.TELEGRAM_TOKEN }}" ]; then echo "TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}" >> $GITHUB_ENV; fi
+          if [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV; fi
+      - name: Run slot 2
+        run: python cron_run_demo.py
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: ops_slot2
+          path: operaciones.csv
+
+  slot3:
+    name: Slot 3 (~5h)
+    runs-on: ubuntu-latest
+    needs: slot2
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas requests
+      - name: Get CSV from slot2
+        uses: actions/download-artifact@v4
+        with:
+          name: ops_slot2
+          path: .
+      - name: Recreate runner script
+        run: cp cron_run_demo.py cron_run_demo.py || true
+      - name: Prepare env
+        run: |
+          echo "CSV_PATH=operaciones.csv" >> $GITHUB_ENV
+          echo "RUNTIME_SEC=17900" >> $GITHUB_ENV
+          echo "SLEEP_SEC=10" >> $GITHUB_ENV
+          echo "SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT" >> $GITHUB_ENV
+          echo "RISK_AGRESIVO=0.05" >> $GITHUB_ENV
+          echo "RISK_MODERADO=0.025" >> $GITHUB_ENV
+          echo "RISK_CONSERVADOR=0.01" >> $GITHUB_ENV
+          echo "FEE_TAKER=0.001" >> $GITHUB_ENV
+          echo "SPREAD_BPS=0.0002" >> $GITHUB_ENV
+          if [ -n "${{ secrets.TELEGRAM_TOKEN }}" ]; then echo "TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}" >> $GITHUB_ENV; fi
+          if [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV; fi
+      - name: Run slot 3
+        run: python cron_run_demo.py
+      - name: Upload CSV final
+        uses: actions/upload-artifact@v4
+        with:
+          name: operaciones_final
+          path: operaciones.csv
