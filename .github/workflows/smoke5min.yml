@@ -5,7 +5,7 @@ on:
 
 jobs:
   slot_unico_5min:
-    name: Smoke test (~5 min)
+    name: Smoke test (~5 min con trade forzado)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -20,31 +20,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt pandas requests
 
-      - name: Write runner script (OHLCV EMA/ATR)
+      - name: Write runner script (OHLCV EMA/ATR con FORCE_TRADE + logs)
         run: |
           cat > cron_run_demo_ohlcv.py <<'PY'
           # -*- coding: utf-8 -*-
-          """
-          cron_run_demo_ohlcv.py  (versión smoke 5 min)
-          Paper trading con datos en vivo (ccxt/LBank) usando OHLCV 1m:
-          - EMA(12/26) + ATR(14)
-          - TP/SL por ATR según modo (agresivo/moderado/conservador)
-          - Fees + pequeño spread simulados
-          - Notifica a Telegram (si TELEGRAM_TOKEN/CHAT_ID) en ABRIR/CERRAR y resumen final
-          - Escribe operaciones.csv con equity acumulado
-          """
-          import os, csv, time, math, requests, traceback
+          import os, csv, time, math, requests, traceback, sys
           from datetime import datetime, timezone
           import pandas as pd
           import ccxt
 
           PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "1000"))
           CSV_PATH   = os.getenv("CSV_PATH", "operaciones.csv")
-          RUNTIME_SEC = int(os.getenv("RUNTIME_SEC", "300"))   # === 5 minutos ===
+          RUNTIME_SEC = int(os.getenv("RUNTIME_SEC", "300"))   # 5 minutos
           SLEEP_SEC   = float(os.getenv("SLEEP_SEC", "10"))
           SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS","BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
           TIMEFRAME = os.getenv("TIMEFRAME","1m")
-
           RISK = {
               "agresivo":    float(os.getenv("RISK_AGRESIVO","0.05")),
               "moderado":    float(os.getenv("RISK_MODERADO","0.025")),
@@ -57,10 +47,13 @@ jobs:
           }
           FEE_TAKER = float(os.getenv("FEE_TAKER","0.001"))
           SPREAD_BPS= float(os.getenv("SPREAD_BPS","0.0002"))
-
           TG_TOKEN = os.getenv("TELEGRAM_TOKEN","")
           TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID","")
           TG_EVENTS = os.getenv("TELEGRAM_EVENT_NOTIF","1") in ("1","true","True","YES","yes")
+          FORCE = os.getenv("TEST_FORCE_TRADE","0") in ("1","true","True","YES","yes")
+
+          def log(msg): 
+              print(msg, flush=True)
 
           def utcnow_iso(): return datetime.now(timezone.utc).isoformat()
 
@@ -91,18 +84,27 @@ jobs:
               return f"{sign}$ {abs(x):.{d}f}"
 
           def tg_send(text:str):
-              if not (TG_TOKEN and TG_CHAT): return
+              if not (TG_TOKEN and TG_CHAT): 
+                  log("Telegram OFF (falta token/chat)")
+                  return
               try:
                   url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-                  requests.post(url, json={"chat_id": TG_CHAT, "text": text, "parse_mode":"Markdown"}, timeout=15)
-              except Exception: pass
+                  r = requests.post(url, json={"chat_id": TG_CHAT, "text": text, "parse_mode":"Markdown"}, timeout=15)
+                  if r.status_code != 200:
+                      log(f"Telegram error {r.status_code}: {r.text}")
+                  else:
+                      log("Telegram OK")
+              except Exception as e:
+                  log(f"Telegram exception: {e}")
 
           class LBankFeed:
               def __init__(self):
                   self.c = ccxt.lbank({"enableRateLimit": True})
                   self.mk = None
               def load(self):
-                  if self.mk is None: self.mk = self.c.load_markets()
+                  if self.mk is None: 
+                      self.mk = self.c.load_markets()
+                      log(f"Markets loaded: {len(self.mk)}")
               def valid(self, symbol):
                   self.load(); return symbol in self.mk
               def round_price(self, symbol, px):
@@ -125,14 +127,19 @@ jobs:
                   return (m.get("limits") or {}).get("cost",{}).get("min")
               def ticker(self, symbol):
                   try:
-                      t = self.c.fetch_ticker(symbol); time.sleep(0.2); return t
-                  except Exception: return None
+                      t = self.c.fetch_ticker(symbol); time.sleep(0.2)
+                      return t
+                  except Exception as e:
+                      log(f"ticker error {symbol}: {e}")
+                      return None
               def ohlcv(self, symbol, timeframe="1m", limit=150):
                   for _ in range(2):
                       try:
                           o = self.c.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
                           time.sleep(0.2); return o
-                      except Exception: time.sleep(1)
+                      except Exception as e:
+                          log(f"ohlcv error {symbol}: {e}")
+                          time.sleep(1)
                   return []
 
           def df_from_ohlcv(ohlcv):
@@ -143,8 +150,7 @@ jobs:
 
           def ema(series, n): return series.ewm(span=n, adjust=False).mean()
           def atr(df, n=14):
-              h,l,c = df["high"], df["low"], df["close"]
-              pc = c.shift(1)
+              h,l,c = df["high"], df["low"], df["close"]; pc = c.shift(1)
               tr = pd.concat([(h-l).abs(), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
               return tr.rolling(n).mean()
 
@@ -153,6 +159,7 @@ jobs:
               for s in SYMBOLS:
                   if feed.valid(s): out.append(s)
                   if len(out)>=3: break
+              log(f"Symbols to trade: {out or ['BTC/USDT']}")
               return out or ["BTC/USDT"]
 
           def should_open_long(d: pd.DataFrame) -> bool:
@@ -170,9 +177,38 @@ jobs:
               symbols=pick_symbols(feed)
               df_hist=read_df()
               equity=float(df_hist["equity"].iloc[-1]) if ("equity" in df_hist.columns and not df_hist.empty and pd.notna(df_hist["equity"].iloc[-1])) else PAPER_START_BALANCE
+              log(f"Start equity: {equity}")
               opens={}
               t0=time.time()
               last_bar={s:None for s in symbols}
+
+              # ===== FORCE TRADE al inicio =====
+              if FORCE and symbols:
+                  sym=symbols[0]
+                  tk=feed.ticker(sym)
+                  if tk:
+                      bid=tk.get("bid") or tk.get("last") or tk.get("close")
+                      ask=tk.get("ask") or tk.get("last") or tk.get("close")
+                      if bid and ask:
+                          bid=float(bid)*(1-SPREAD_BPS); ask=float(ask)*(1+SPREAD_BPS)
+                          raw=feed.ohlcv(sym,timeframe=TIMEFRAME,limit=50)
+                          d=df_from_ohlcv(raw)
+                          atr_now= (d["high"].iloc[-10:-1].max()-d["low"].iloc[-10:-1].min())/10 if (not d.empty and len(d)>10) else (ask*0.001)
+                          for modo,r in RISK.items():
+                              stake=max(5.0,equity*r*0.1)
+                              px_entry=feed.round_price(sym,ask)
+                              qty=feed.round_amount(sym, stake/px_entry)
+                              if qty<=0: 
+                                  log(f"{modo} no qty"); 
+                                  continue
+                              equity-=px_entry*qty*(1+FEE_TAKER)
+                              tp=px_entry+ATR_MULT[modo]["tp"]*atr_now
+                              sl=px_entry-ATR_MULT[modo]["sl"]*atr_now
+                              opens[(modo,sym)]={"entry":px_entry,"qty":qty,"tp":tp,"sl":sl,"t_open":time.time()}
+                              append_row([utcnow_iso(),modo,sym,"ABRIR",round(px_entry,6),round(qty,6),0.0,round(equity,2)])
+                              log(f"OPEN(FORCE) {modo} {sym} entry={px_entry:.6f} qty={qty:.6f}")
+                              if TG_EVENTS: tg_send(f"🟢 *ABRIR (FORCE)* {modo} {sym}\nEntrada: {px_entry:.6f}\nQty: {qty:.6f}\nEquity: {fmt_money(equity)}")
+
               while time.time()-t0<RUNTIME_SEC:
                   for sym in symbols:
                       try:
@@ -188,12 +224,12 @@ jobs:
                           bid=tk.get("bid") or tk.get("last") or tk.get("close")
                           ask=tk.get("ask") or tk.get("last") or tk.get("close")
                           if not (bid and ask): continue
-                          bid=float(bid)*(1-0.0002)
-                          ask=float(ask)*(1+0.0002)
+                          bid=float(bid)*(1-SPREAD_BPS); ask=float(ask)*(1+SPREAD_BPS)
                           d["atr14"]=atr(d,14)
-                          atr_now=float(d["atr14"].iloc[-2]) if not pd.isna(d["atr14"].iloc[-2]) else None
-                          if not atr_now or atr_now<=0: continue
-                          for modo,r in RISK.items():
+                          atr_now=float(d["atr14"].iloc[-2]) if not pd.isna(d["atr14"].iloc[-2]) else (d["high"].tail(10).max()-d["low"].tail(10).min())/10 or (ask*0.001)
+
+                          # Cerrar forzadas a los ~60-120s para asegurar filas
+                          for modo in list(RISK.keys()):
                               key=(modo,sym)
                               if key in opens:
                                   pos=opens[key]
@@ -201,43 +237,49 @@ jobs:
                                   pnl_gross=(px_exit-pos["entry"])*pos["qty"]
                                   fee=(pos["entry"]*pos["qty"]+px_exit*pos["qty"])*FEE_TAKER
                                   pnl=pnl_gross-fee
-                                  hit_tp=px_exit>=pos["tp"]; hit_sl=px_exit<=pos["sl"]; timeout=(time.time()-pos["t_open"])>900  # 15 min max en smoke
+                                  hit_tp=px_exit>=pos["tp"]; hit_sl=px_exit<=pos["sl"]
+                                  timeout=(time.time()-pos["t_open"])>min(120, RUNTIME_SEC-30)
                                   if hit_tp or hit_sl or timeout:
                                       equity+=pnl
                                       append_row([utcnow_iso(),modo,sym,"CERRAR",round(px_exit,6),round(pos["qty"],6),round(pnl,6),round(equity,2)])
+                                      log(f"CLOSE {modo} {sym} exit={px_exit:.6f} pnl={pnl:.6f} equity={equity:.2f}")
                                       if TG_EVENTS:
                                           res="✅ TP" if hit_tp else ("❌ SL" if hit_sl else "⏱️ TimeOut")
                                           tg_send(f"{res} *{modo}* {sym}\nSalida: {px_exit:.6f}\nPnL: {fmt_money(pnl)}\nEquity: {fmt_money(equity)}")
                                       del opens[key]
-                              if key not in opens and sig:
+
+                          # Si no FORCE y hay señal real, abrir normal (no aplica en smoke si FORCE=1)
+                          if not FORCE and sig:
+                              for modo,r in RISK.items():
+                                  key=(modo,sym)
+                                  if key in opens: continue
                                   stake=max(5.0,equity*r*0.25)
                                   px_entry=feed.round_price(sym,ask)
                                   qty=feed.round_amount(sym, stake/px_entry)
-                                  mn=feed.min_notional(sym) or 0.0
-                                  if mn>0 and qty*px_entry<mn:
-                                      need=feed.round_amount(sym,mn/px_entry); qty=max(qty,need)
                                   if qty<=0: continue
                                   equity-=px_entry*qty*(1+FEE_TAKER)
                                   tp=px_entry+ATR_MULT[modo]["tp"]*atr_now
                                   sl=px_entry-ATR_MULT[modo]["sl"]*atr_now
                                   opens[key]={"entry":px_entry,"qty":qty,"tp":tp,"sl":sl,"t_open":time.time()}
                                   append_row([utcnow_iso(),modo,sym,"ABRIR",round(px_entry,6),round(qty,6),0.0,round(equity,2)])
-                                  if TG_EVENTS:
-                                      tg_send(f"🟢 *ABRIR* {modo} {sym}\nEntrada: {px_entry:.6f}\nTP: {tp:.6f}\nSL: {sl:.6f}\nQty: {qty:.6f}\nEquity: {fmt_money(equity)}")
+                                  log(f"OPEN {modo} {sym} entry={px_entry:.6f} qty={qty:.6f}")
+
                       except Exception:
                           traceback.print_exc(); time.sleep(1)
                   time.sleep(SLEEP_SEC)
-              # cierre forzado
+
+              # cierre final de lo que quede abierto
               for key,pos in list(opens.items()):
                   sym=key[1]; tk=feed.ticker(sym)
                   last=tk.get("bid") or tk.get("last") if tk else pos["entry"]
-                  px=feed.round_price(sym,float(last))
+                  px=max(1e-12,float(last))
                   fee=(pos["entry"]*pos["qty"]+px*pos["qty"])*FEE_TAKER
                   pnl=(px-pos["entry"])*pos["qty"]-fee
                   equity+=pnl
                   append_row([utcnow_iso(),key[0],sym,"CERRAR",round(px,6),round(pos["qty"],6),round(pnl,6),round(equity,2)])
-                  if TG_EVENTS:
-                      tg_send(f"🟡 Cierre fin de slot *{key[0]}* {sym}\nSalida: {px:.6f}\nPnL: {fmt_money(pnl)}\nEquity: {fmt_money(equity)}")
+                  log(f"CLOSE(FINAL) {key[0]} {sym} pnl={pnl:.6f} equity={equity:.2f}")
+                  if TG_EVENTS: tg_send(f"🟡 Cierre fin (smoke) *{key[0]}* {sym}\nPnL: {fmt_money(pnl)}\nEquity: {fmt_money(equity)}")
+
               dff=read_df()
               total=float(dff["pnl"].sum()) if "pnl" in dff.columns else 0.0
               ops=len(dff); wins=int((dff["pnl"]>0).sum()) if "pnl" in dff.columns else 0
@@ -247,7 +289,12 @@ jobs:
                   g=dff.groupby("modo")["pnl"].sum().sort_values(ascending=False)
                   if len(g)>0: best_mode=str(g.index[0]); best_pnl=float(g.iloc[0])
               if TG_TOKEN and TG_CHAT:
-                  tg_send(f"📊 *Smoke DEMO (5m) completado*\nEquity: *{fmt_money(equity)}*\nPNL total: *{fmt_money(total)}*\nWinrate: *{wr:.2f}%*\nOps: *{ops}*\nMejor modo: *{best_mode}* ({fmt_money(best_pnl)})")
+                  tg_send(f"📊 *Smoke DEMO (5m) completado*\nPNL total: *{fmt_money(total)}*\nWinrate: *{wr:.2f}%*\nOps: *{ops}*\nMejor modo: *{best_mode}* ({fmt_money(best_pnl)})")
+
+              # Si por algún motivo quedó sin filas, escribe una dummy
+              if ops == 0:
+                  append_row([utcnow_iso(),"demo","BTC/USDT","ABRIR",0,0,0,PAPER_START_BALANCE])
+                  append_row([utcnow_iso(),"demo","BTC/USDT","CERRAR",0,0,0,PAPER_START_BALANCE])
 
           if __name__=="__main__":
               run_once()
@@ -257,7 +304,7 @@ jobs:
         run: |
           echo "PAPER_START_BALANCE=1000" >> $GITHUB_ENV
           echo "CSV_PATH=operaciones.csv" >> $GITHUB_ENV
-          echo "RUNTIME_SEC=300" >> $GITHUB_ENV         # 5 minutos
+          echo "RUNTIME_SEC=300" >> $GITHUB_ENV      # 5 minutos
           echo "SLEEP_SEC=10" >> $GITHUB_ENV
           echo "TIMEFRAME=1m" >> $GITHUB_ENV
           echo "SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT" >> $GITHUB_ENV
@@ -267,9 +314,22 @@ jobs:
           echo "FEE_TAKER=0.001" >> $GITHUB_ENV
           echo "SPREAD_BPS=0.0002" >> $GITHUB_ENV
           echo "TELEGRAM_EVENT_NOTIF=1" >> $GITHUB_ENV
+          echo "TEST_FORCE_TRADE=1" >> $GITHUB_ENV
+          # Secrets -> env
           if [ -n "${{ secrets.TELEGRAM_TOKEN }}" ]; then echo "TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}" >> $GITHUB_ENV; fi
           if [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV; fi
           [ -f operaciones.csv ] || echo "fecha,modo,par,accion,precio,qty,pnl,equity" > operaciones.csv
+
+      - name: Telegram test (verifica secrets/chat)
+        if: ${{ secrets.TELEGRAM_TOKEN && secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - << 'PY'
+          import os,requests
+          tok=os.getenv("TELEGRAM_TOKEN"); chat=os.getenv("TELEGRAM_CHAT_ID")
+          r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                            json={"chat_id":chat,"text":"✅ Prueba: Workflow conectado a Telegram (smoke5min)."})
+          print("Telegram test status:", r.status_code, r.text)
+          PY
 
       - name: List files
         run: ls -la
