@@ -24,7 +24,7 @@ jobs:
         run: |
           cat > cron_run_demo_ohlcv.py <<'PY'
           # -*- coding: utf-8 -*-
-          import os, csv, time, math, requests, traceback, sys
+          import os, csv, time, math, requests, traceback
           from datetime import datetime, timezone
           import pandas as pd
           import ccxt
@@ -35,16 +35,12 @@ jobs:
           SLEEP_SEC   = float(os.getenv("SLEEP_SEC", "10"))
           SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS","BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
           TIMEFRAME = os.getenv("TIMEFRAME","1m")
-          RISK = {
-              "agresivo":    float(os.getenv("RISK_AGRESIVO","0.05")),
-              "moderado":    float(os.getenv("RISK_MODERADO","0.025")),
-              "conservador": float(os.getenv("RISK_CONSERVADOR","0.01")),
-          }
-          ATR_MULT = {
-              "agresivo":    {"tp": 1.6, "sl": 1.0},
-              "moderado":    {"tp": 1.4, "sl": 1.0},
-              "conservador": {"tp": 1.2, "sl": 1.0},
-          }
+          RISK = {"agresivo":float(os.getenv("RISK_AGRESIVO","0.05")),
+                  "moderado":float(os.getenv("RISK_MODERADO","0.025")),
+                  "conservador":float(os.getenv("RISK_CONSERVADOR","0.01"))}
+          ATR_MULT = {"agresivo":{"tp":1.6,"sl":1.0},
+                      "moderado":{"tp":1.4,"sl":1.0},
+                      "conservador":{"tp":1.2,"sl":1.0}}
           FEE_TAKER = float(os.getenv("FEE_TAKER","0.001"))
           SPREAD_BPS= float(os.getenv("SPREAD_BPS","0.0002"))
           TG_TOKEN = os.getenv("TELEGRAM_TOKEN","")
@@ -52,9 +48,7 @@ jobs:
           TG_EVENTS = os.getenv("TELEGRAM_EVENT_NOTIF","1") in ("1","true","True","YES","yes")
           FORCE = os.getenv("TEST_FORCE_TRADE","0") in ("1","true","True","YES","yes")
 
-          def log(msg): 
-              print(msg, flush=True)
-
+          def log(msg): print(msg, flush=True)
           def utcnow_iso(): return datetime.now(timezone.utc).isoformat()
 
           def ensure_csv(path):
@@ -84,7 +78,7 @@ jobs:
               return f"{sign}$ {abs(x):.{d}f}"
 
           def tg_send(text:str):
-              if not (TG_TOKEN and TG_CHAT): 
+              if not (TG_TOKEN and TG_CHAT):
                   log("Telegram OFF (falta token/chat)")
                   return
               try:
@@ -102,7 +96,7 @@ jobs:
                   self.c = ccxt.lbank({"enableRateLimit": True})
                   self.mk = None
               def load(self):
-                  if self.mk is None: 
+                  if self.mk is None:
                       self.mk = self.c.load_markets()
                       log(f"Markets loaded: {len(self.mk)}")
               def valid(self, symbol):
@@ -127,19 +121,16 @@ jobs:
                   return (m.get("limits") or {}).get("cost",{}).get("min")
               def ticker(self, symbol):
                   try:
-                      t = self.c.fetch_ticker(symbol); time.sleep(0.2)
-                      return t
+                      t = self.c.fetch_ticker(symbol); time.sleep(0.2); return t
                   except Exception as e:
-                      log(f"ticker error {symbol}: {e}")
-                      return None
+                      log(f"ticker error {symbol}: {e}"); return None
               def ohlcv(self, symbol, timeframe="1m", limit=150):
                   for _ in range(2):
                       try:
                           o = self.c.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
                           time.sleep(0.2); return o
                       except Exception as e:
-                          log(f"ohlcv error {symbol}: {e}")
-                          time.sleep(1)
+                          log(f"ohlcv error {symbol}: {e}"); time.sleep(1)
                   return []
 
           def df_from_ohlcv(ohlcv):
@@ -228,7 +219,7 @@ jobs:
                           d["atr14"]=atr(d,14)
                           atr_now=float(d["atr14"].iloc[-2]) if not pd.isna(d["atr14"].iloc[-2]) else (d["high"].tail(10).max()-d["low"].tail(10).min())/10 or (ask*0.001)
 
-                          # Cerrar forzadas a los ~60-120s para asegurar filas
+                          # Cerrar forzadas pronto para asegurar filas
                           for modo in list(RISK.keys()):
                               key=(modo,sym)
                               if key in opens:
@@ -248,7 +239,7 @@ jobs:
                                           tg_send(f"{res} *{modo}* {sym}\nSalida: {px_exit:.6f}\nPnL: {fmt_money(pnl)}\nEquity: {fmt_money(equity)}")
                                       del opens[key]
 
-                          # Si no FORCE y hay señal real, abrir normal (no aplica en smoke si FORCE=1)
+                          # Si no FORCE y hay señal real, abrir normal
                           if not FORCE and sig:
                               for modo,r in RISK.items():
                                   key=(modo,sym)
@@ -291,7 +282,6 @@ jobs:
               if TG_TOKEN and TG_CHAT:
                   tg_send(f"📊 *Smoke DEMO (5m) completado*\nPNL total: *{fmt_money(total)}*\nWinrate: *{wr:.2f}%*\nOps: *{ops}*\nMejor modo: *{best_mode}* ({fmt_money(best_pnl)})")
 
-              # Si por algún motivo quedó sin filas, escribe una dummy
               if ops == 0:
                   append_row([utcnow_iso(),"demo","BTC/USDT","ABRIR",0,0,0,PAPER_START_BALANCE])
                   append_row([utcnow_iso(),"demo","BTC/USDT","CERRAR",0,0,0,PAPER_START_BALANCE])
@@ -315,20 +305,22 @@ jobs:
           echo "SPREAD_BPS=0.0002" >> $GITHUB_ENV
           echo "TELEGRAM_EVENT_NOTIF=1" >> $GITHUB_ENV
           echo "TEST_FORCE_TRADE=1" >> $GITHUB_ENV
-          # Secrets -> env
+          # Secrets -> env (con espacios correctos en [ ])
           if [ -n "${{ secrets.TELEGRAM_TOKEN }}" ]; then echo "TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}" >> $GITHUB_ENV; fi
           if [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV; fi
           [ -f operaciones.csv ] || echo "fecha,modo,par,accion,precio,qty,pnl,equity" > operaciones.csv
 
-      - name: Telegram test (verifica secrets/chat)
-        if: ${{ secrets.TELEGRAM_TOKEN && secrets.TELEGRAM_CHAT_ID }}
+      - name: Telegram test (si hay credenciales)
         run: |
           python - << 'PY'
           import os,requests
-          tok=os.getenv("TELEGRAM_TOKEN"); chat=os.getenv("TELEGRAM_CHAT_ID")
-          r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                            json={"chat_id":chat,"text":"✅ Prueba: Workflow conectado a Telegram (smoke5min)."})
-          print("Telegram test status:", r.status_code, r.text)
+          tok=os.getenv("TELEGRAM_TOKEN",""); chat=os.getenv("TELEGRAM_CHAT_ID","")
+          if tok and chat:
+              r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                                json={"chat_id":chat,"text":"✅ Prueba: Workflow conectado a Telegram (smoke5min)."})
+              print("Telegram test status:", r.status_code, r.text)
+          else:
+              print("Telegram no configurado (omitiendo test).")
           PY
 
       - name: List files
