@@ -1,0 +1,18 @@
+name: Keep Cron Alive
+
+on:
+  schedule:
+    - cron: "0 9 * * MON"   # lunes 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Keepalive (empty commit if needed)
+        uses: gautamkrishnar/keepalive-workflow@master
+        with:
+          commit_message: "chore: keep actions alive"
+          time_elapsed: 50   # días (crea commit si está cerca del límite)
