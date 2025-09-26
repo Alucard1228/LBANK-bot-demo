@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Bot PAPER replicando Zaffex: 3 modos independientes (agresivo, moderado, conservador)
-Configuración REALISTA que imita al bot original Zaffex
-Saldo: $235, operaciones pequeñas, sin pausas innecesarias
+Bot PAPER replicando Zaffex - VERSIÓN PRODUCCIÓN
+Ejecuta continuamente sin detenerse
 """
 
 import os, time, ccxt
@@ -17,12 +16,12 @@ from telegram_notifier import TelegramNotifier
 from state_store import save_state, load_state
 import ta
 
-# Forzar timezone UTC para Railway
+# Forzar timezone UTC
 os.environ['TZ'] = 'UTC'
 try:
     time.tzset()
 except:
-    pass  # Windows no tiene tzset, pero Railway es Linux
+    pass
 
 STATE_PATH = "paper_state.json"
 
@@ -51,11 +50,9 @@ def get_exchange(ex_id: str, apiKey: str, secret: str):
     for name in candidates:
         cls = getattr(ccxt, name, None)
         if cls:
-            print(f"[CFG] Usando exchange {name}")
             return cls({"apiKey": apiKey, "secret": secret, "enableRateLimit": True})
     cls = getattr(ccxt, "binance", None)
     if cls:
-        print(f"[WARN] {ex_id} no disponible. Usando binance (feed PAPER).")
         return cls({"enableRateLimit": True})
     raise RuntimeError(f"Exchange no soportado: {ex_id}")
 
@@ -65,12 +62,11 @@ def calculate_rsi(df: pd.DataFrame, period: int = 9) -> pd.Series:
 def main():
     env = load_env(".env")
     
-    # === FORZAR INICIO FRESCO (CAMBIA A False DESPUÉS DEL PRIMER ÉXITO) ===
-    FORCE_FRESH_START = True
+    # FORZAR MODO PRODUCCIÓN
+    FORCE_PRODUCTION = True
 
     EXCHANGE_ID = env.get("EXCHANGE","lbank")
     SYMBOLS = ["btc_usdt", "eth_usdt"]
-
     LTF = clean_tf(env.get("TIMEFRAME_LTF","1m"))
 
     RISK   = {"agresivo": parse_float(env.get("RISK_AGRESIVO","0.20"),0.20),
@@ -104,261 +100,100 @@ def main():
                   "moderado": parse_int(env.get("BATCH_SIZE_MODERADO","4"),4),
                   "conservador": parse_int(env.get("BATCH_SIZE_CONSERVADOR","5"),5)}
 
-    AUTO_SUMMARY_MIN = parse_int(env.get("AUTO_SUMMARY_MIN","15"),15)
     SLEEP_SEC = parse_int(env.get("SLEEP_SEC","2"),2)
     CSV_PATH = env.get("CSV_PATH","operaciones_zaffex.csv")
     PAPER_START_BALANCE = parse_float(env.get("PAPER_START_BALANCE","235"),235.0)
 
-    # Inicialización de Telegram
     tg = TelegramNotifier(env.get("TELEGRAM_TOKEN"), env.get("TELEGRAM_ALLOWED_IDS"))
     if tg.enabled():
         tg.send("🤖 Bot Zaffex REALISTA iniciado — Saldo: $235")
-    else:
-        print("[DEBUG] Telegram deshabilitado")
 
     try:
         ex = get_exchange(EXCHANGE_ID, env.get("API_KEY",""), env.get("API_SECRET",""))
     except Exception as e:
-        print(f"[ERR] Exchange init: {e}")
         if tg.enabled(): 
             tg.send_error(f"Exchange init: {str(e)[:200]}")
         return
 
-    # === INICIALIZACIÓN FRESCA (sin cargar estado guardado) ===
     portfolio = PaperPortfolio(start_eq=PAPER_START_BALANCE, fee_taker=FEE_TAKER)
     logger = TradeLogger(csv_path=CSV_PATH)
     
-    if not FORCE_FRESH_START:
-        st = load_state(STATE_PATH)
-        if st:
-            try:
-                portfolio.equity = float(st.get("equity", portfolio.equity))
-                for pos_data in st.get("positions", []):
-                    portfolio.open(
-                        pos_data["mode"], 
-                        pos_data["symbol"], 
-                        pos_data["side"],
-                        pos_data["entry"], 
-                        pos_data["qty"], 
-                        pos_data["sl"], 
-                        pos_data["tp"],
-                        reopen=True
-                    )
-                print(f"[STATE] Restaurado: equity={portfolio.equity:.2f} | open={len(portfolio.positions)}")
-            except Exception as e:
-                print(f"[STATE] No se pudo restaurar: {e}")
-    else:
-        print(f"[FRESH] Inicio fresco con equity={PAPER_START_BALANCE}")
+    print(f"[FRESH] Inicio fresco con equity={PAPER_START_BALANCE}")
+    print(f"[INFO] Zaffex REALISTA: Saldo ${PAPER_START_BALANCE} | LTF={LTF}")
 
     last_ltf_close: Dict[str, Optional[pd.Timestamp]] = {s: None for s in SYMBOLS}
     last_entry_time: Dict[str, datetime] = {}
     symbol_lock_until: Dict[str, datetime] = {}
-    summary_since = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
-    daily_stats = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
-    losses_today = 0
-    
-    current_time = datetime.now(timezone.utc)
-    day_str = current_time.date().isoformat()
     paused_until: Optional[datetime] = None
 
-    print(f"[INFO] Zaffex REALISTA: Saldo ${PAPER_START_BALANCE} | LTF={LTF}")
-    print(f"[INFO] Riesgo: Agresivo={RISK['agresivo']}, Moderado={RISK['moderado']}, Conservador={RISK['conservador']}")
+    # ✅ BUCLE INFINITO SIN CONDICIONES DE SALIDA
+    while True:
+        now = datetime.now(timezone.utc)
 
-    next_summary_at = current_time.replace(second=0, microsecond=0) + timedelta(minutes=AUTO_SUMMARY_MIN)
+        for symbol in SYMBOLS:
+            try:
+                df_ltf = fetch_ohlcv_df(ex, symbol, LTF, limit=100)
+            except Exception as e:
+                if tg.enabled(): tg.send_error(f"Error datos {symbol}: {str(e)[:200]}")
+                continue
 
-    try:
-        while True:
-            now = datetime.now(timezone.utc)
+            ltf_last_close_ts = df_ltf.index[-1]
+            if last_ltf_close[symbol] is not None and ltf_last_close_ts <= last_ltf_close[symbol]:
+                continue
+            last_ltf_close[symbol] = ltf_last_close_ts
 
-            if now.date().isoformat() != day_str:
-                losses_today = 0; day_str = now.date().isoformat()
-                daily_stats = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
+            # Cierre de posiciones
+            last_px = float(df_ltf["close"].iloc[-1])
+            for profile in ["agresivo", "moderado", "conservador"]:
+                active_positions = portfolio.get_positions(profile, symbol)
+                for pos in active_positions[:]:
+                    if last_px >= pos.tp or last_px <= pos.sl:
+                        pnl, fee = portfolio.close_position(pos, last_px)
+                        portfolio.remove_position(pos)
+                        if tg.enabled():
+                            tg.send(f"✅ {'TP' if last_px >= pos.tp else 'SL'} {symbol} PnL: {pnl:.6f}")
 
-            if paused_until and now < paused_until:
-                save_state(STATE_PATH, portfolio.equity, portfolio.positions)
-                time.sleep(SLEEP_SEC); continue
-            else:
-                paused_until = None
+            # Verificación de límites
+            eq_dd = max(0.0, (PAPER_START_BALANCE - portfolio.equity) / PAPER_START_BALANCE)
+            if eq_dd >= DAILY_LOSS_LIMIT_PCT:
+                cooldown_minutes = 30
+                paused_until = now + timedelta(minutes=cooldown_minutes)
+                if tg.enabled(): 
+                    tg.send(f"⏸️ Pausa {cooldown_minutes} min por límite diario")
+                time.sleep(60)
+                continue
 
-            if AUTO_SUMMARY_MIN > 0 and now >= next_summary_at:
-                tr = summary_since["trades"]; wr = (summary_since["wins"]/tr*100.0) if tr>0 else 0.0
-                print("[SUMMARY]", f"🕒 Resumen {AUTO_SUMMARY_MIN}m | Ops: {tr} | Win: {summary_since['wins']} | Loss: {summary_since['losses']} | WR: {wr:.1f}% | PnL: {summary_since['pnl']:.6f} | Equity: {portfolio.equity:.2f}")
-                
-                if tg.enabled():
-                    daily_dd = max(0.0, (PAPER_START_BALANCE - portfolio.equity) / PAPER_START_BALANCE) * 100
-                    mode_counts = {"agresivo": 0, "moderado": 0, "conservador": 0}
-                    for pos in portfolio.positions:
-                        if pos.mode in mode_counts:
-                            mode_counts[pos.mode] += 1
+            # Señal de entrada
+            rsi_series = calculate_rsi(df_ltf, RSI_PERIOD)
+            current_rsi = rsi_series.iloc[-1]
+
+            for profile in ["agresivo", "moderado", "conservador"]:
+                if current_rsi < RSI_BUY_THRESHOLD:
+                    risk_frac = RISK[profile]
+                    total_risk_capital = portfolio.equity * risk_frac
+                    batch_size = BATCH_SIZE[profile]
+                    entry = last_px * (1 + SPREAD_BPS)
+                    sl_pct = SL_PCT[profile] / 100.0
+                    tp_pct = TP_PCT[profile] / 100.0
+                    notional_per_lot = total_risk_capital / batch_size
                     
-                    tg.send_summary(
-                        minutes=AUTO_SUMMARY_MIN,
-                        trades=tr,
-                        wins=summary_since["wins"],
-                        losses=summary_since["losses"],
-                        win_rate=wr,
-                        pnl=summary_since["pnl"],
-                        equity=portfolio.equity,
-                        daily_dd=daily_dd,
-                        by_mode=mode_counts
-                    )
-                
-                summary_since = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
-                next_summary_at = now.replace(second=0, microsecond=0) + timedelta(minutes=AUTO_SUMMARY_MIN)
+                    if notional_per_lot < MIN_NOTIONAL_USDT:
+                        notional_per_lot = MIN_NOTIONAL_USDT
+                    qty_per_lot = notional_per_lot / entry
+                    
+                    for i in range(batch_size):
+                        if len(portfolio.positions) >= DEMO_MAX_POSITIONS:
+                            break
+                        sl = entry * (1 - sl_pct)
+                        tp = entry * (1 + tp_pct)
+                        portfolio.open(profile, symbol, "long", entry, qty_per_lot, sl, tp)
+                    
+                    if tg.enabled():
+                        tg.send(f"📈 OPEN {symbol} {profile} x{batch_size} lotes @ {entry:.2f}")
+                    break  # Solo una señal por ciclo
 
-            for symbol in SYMBOLS:
-                if symbol in symbol_lock_until and now < symbol_lock_until[symbol]:
-                    continue
-                try:
-                    df_ltf = fetch_ohlcv_df(ex, symbol, LTF, limit=100)
-                except Exception as e:
-                    print(f"[WARN] fetch ohlcv {symbol} falló: {e}")
-                    if tg.enabled(): tg.send_error(f"Error datos {symbol}: {str(e)[:200]}")
-                    continue
-
-                ltf_last_close_ts = df_ltf.index[-1]
-                if last_ltf_close[symbol] is not None and ltf_last_close_ts <= last_ltf_close[symbol]:
-                    continue
-                last_ltf_close[symbol] = ltf_last_close_ts
-
-                # === Cierre para los 3 modos ===
-                last_px = float(df_ltf["close"].iloc[-1])
-                for profile in ["agresivo", "moderado", "conservador"]:
-                    active_positions = portfolio.get_positions(profile, symbol)
-                    for pos in active_positions[:]:
-                        status = None
-                        if last_px >= pos.tp:
-                            status = "TP"
-                        elif last_px <= pos.sl:
-                            status = "SL"
-                        
-                        if status:
-                            pnl, fee = portfolio.close_position(pos, last_px)
-                            portfolio.remove_position(pos)
-                            logger.close(
-                                f"{symbol}-{pos.open_time}-{profile}",
-                                last_px,
-                                round(pnl,6),
-                                0.0,
-                                reason=status,
-                                equity=portfolio.equity
-                            )
-                            summary_since["trades"] += 1; daily_stats["trades"] += 1
-                            if pnl >= 0: 
-                                summary_since["wins"] += 1; daily_stats["wins"] += 1
-                            else: 
-                                summary_since["losses"] += 1; daily_stats["losses"] += 1; losses_today += 1
-                            summary_since["pnl"] += pnl; daily_stats["pnl"] += pnl
-                            
-                            if tg.enabled(): 
-                                pnl_pct = (pnl / (pos.entry * pos.qty)) * 100 if (pos.entry * pos.qty) > 0 else 0
-                                total_ops = summary_since["trades"] + daily_stats["trades"]
-                                current_wr = (summary_since["wins"] + daily_stats["wins"]) / total_ops * 100 if total_ops > 0 else 0
-                                
-                                tg.send_close(
-                                    symbol=symbol,
-                                    mode=profile,
-                                    exit_price=last_px,
-                                    pnl=pnl,
-                                    pnl_pct=pnl_pct,
-                                    reason=status,
-                                    win_rate=current_wr,
-                                    equity=portfolio.equity,
-                                    total_ops=total_ops
-                                )
-
-                # === Verificación de límites diarios ===
-                eq_dd = max(0.0, (PAPER_START_BALANCE - portfolio.equity) / PAPER_START_BALANCE)
-                if eq_dd >= DAILY_LOSS_LIMIT_PCT or losses_today >= COOLDOWN_LOSSES:
-                    cooldown_minutes = max(1, min(120, COOLDOWN_MIN))
-                    paused_until = now + timedelta(minutes=cooldown_minutes)
-                    print(f"[PAUSE] Límite diario (${DAILY_LOSS_LIMIT_PCT*PAPER_START_BALANCE:.2f}). Pausa {cooldown_minutes} min hasta {paused_until.isoformat()}")
-                    if tg.enabled(): 
-                        tg.send_pause(
-                            minutes=cooldown_minutes,
-                            reason=f"Límite pérdidas diarias (${DAILY_LOSS_LIMIT_PCT*PAPER_START_BALANCE:.2f})"
-                        )
-                    continue
-
-                if len(portfolio.positions) >= DEMO_MAX_POSITIONS:
-                    continue
-
-                # === Señal de entrada para los 3 modos ===
-                rsi_series = calculate_rsi(df_ltf, RSI_PERIOD)
-                current_rsi = rsi_series.iloc[-1]
-
-                for profile in ["agresivo", "moderado", "conservador"]:
-                    cooldown_key = f"{symbol}_{profile}"
-                    t_last = last_entry_time.get(cooldown_key)
-                    if t_last and (now - t_last).total_seconds() < ENTRY_COOLDOWN_MIN*60:
-                        continue
-
-                    if current_rsi < RSI_BUY_THRESHOLD:
-                        # Calcular capital de riesgo realista
-                        risk_frac = RISK[profile]
-                        total_risk_capital = portfolio.equity * risk_frac
-                        batch_size = BATCH_SIZE[profile]
-                        entry = last_px * (1 + SPREAD_BPS)
-                        tp_pct = TP_PCT[profile] / 100.0
-                        sl_pct = SL_PCT[profile] / 100.0
-                        
-                        # Tamaño por lote
-                        notional_per_lot = total_risk_capital / batch_size
-                        
-                        # Aplicar límites
-                        if notional_per_lot < MIN_NOTIONAL_USDT:
-                            notional_per_lot = MIN_NOTIONAL_USDT
-                        max_per_lot = DEMO_MAX_TRADE_USDT / batch_size
-                        if notional_per_lot > max_per_lot:
-                            notional_per_lot = max_per_lot
-                        
-                        qty_per_lot = notional_per_lot / entry
-                        
-                        # Ajustar batch size si excede límites
-                        total_notional = notional_per_lot * batch_size
-                        if total_notional > DEMO_MAX_TRADE_USDT:
-                            batch_size = int(DEMO_MAX_TRADE_USDT / notional_per_lot)
-                            batch_size = max(1, min(batch_size, BATCH_SIZE[profile]))
-                        
-                        opened = 0
-                        for i in range(batch_size):
-                            if len(portfolio.positions) >= DEMO_MAX_POSITIONS:
-                                break
-                            sl = entry * (1 - sl_pct)
-                            tp = entry * (1 + tp_pct)
-                            portfolio.open(profile, symbol, "long", entry, qty_per_lot, sl, tp)
-                            trade_id = f"{symbol}-{now.isoformat()}-{profile}-lot{i}"
-                            logger.open(trade_id, {"symbol":symbol,"mode":profile,"side":"long",
-                                                   "entry_px":round(entry,6),"sl_px":round(sl,6),
-                                                   "tp_px":round(tp,6),"qty":round(qty_per_lot,6)})
-                            opened += 1
-                        
-                        if opened > 0:
-                            last_entry_time[cooldown_key] = now
-                            print(f"[OPEN] {symbol} long [{profile}] x{opened} lotes | entry={entry:.2f} | lot=${notional_per_lot:.2f}")
-                            if tg.enabled(): 
-                                tg.send_open(
-                                    symbol=symbol,
-                                    mode=profile,
-                                    lotes=opened,
-                                    entry=entry,
-                                    sl=sl,
-                                    tp=tp,
-                                    equity=portfolio.equity,
-                                    rsi=current_rsi
-                                )
-
-                symbol_lock_until[symbol] = now + timedelta(minutes=SYMBOL_LOCK_MIN)
-
-            save_state(STATE_PATH, portfolio.equity, portfolio.positions)
-            time.sleep(SLEEP_SEC)
-
-    except KeyboardInterrupt:
-        print(f"[END] Equity final (paper): {portfolio.equity:.2f}")
-        if tg.enabled(): tg.send(f"🛑 Bot detenido. Equity final: {portfolio.equity:.2f}")
-    except Exception as e:
-        print(f"[CRITICAL] Error: {e}")
-        if tg.enabled(): tg.send_error(f"Error crítico: {str(e)[:200]}")
+        save_state(STATE_PATH, portfolio.equity, portfolio.positions)
+        time.sleep(SLEEP_SEC)
 
 if __name__ == "__main__":
     main()
