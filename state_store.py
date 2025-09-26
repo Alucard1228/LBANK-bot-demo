@@ -1,31 +1,38 @@
-# -*- coding: utf-8 -*-
-import json, time, os
+# state_store.py
+import json
+import os
+from typing import List
 
-def save_state(path, equity, positions_dict):
-    """
-    positions_dict: dict[(mode,symbol)] -> Position
-    """
-    data = {
-        "ts": int(time.time()),
-        "equity": float(equity),
+def save_state(path: str, equity: float, positions: List):
+    """Guarda el estado del portfolio (equity + lista de posiciones)"""
+    state = {
+        "equity": equity,
         "positions": []
     }
-    for (mode, symbol), p in positions_dict.items():
-        data["positions"].append({
-            "mode": p.mode,
-            "symbol": p.symbol,
-            "side": p.side,
-            "entry": float(p.entry),
-            "qty": float(p.qty),
-            "sl": float(p.sl),
-            "tp": float(p.tp),
-            "open_time": p.open_time
+    
+    for pos in positions:
+        # Convertir objeto Position a dict
+        state["positions"].append({
+            "mode": pos.mode,
+            "symbol": pos.symbol,
+            "side": pos.side,
+            "entry": pos.entry,
+            "qty": pos.qty,
+            "sl": pos.sl,
+            "tp": pos.tp,
+            "open_time": pos.open_time
         })
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+    
+    with open(path, 'w') as f:
+        json.dump(state, f, indent=2)
 
-def load_state(path):
+def load_state(path: str):
+    """Carga el estado del portfolio"""
     if not os.path.exists(path):
         return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[WARN] No se pudo cargar {path}: {e}")
+        return None
