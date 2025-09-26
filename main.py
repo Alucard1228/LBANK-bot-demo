@@ -2,15 +2,13 @@
 """
 Bot PAPER replicando Zaffex: 3 modos independientes (agresivo, moderado, conservador)
 Cada modo opera con $100 independientes (saldo total = $300)
-Corregido para manejo consistente de UTC
+Corregido para Railway (manejo de fechas y pausas)
 """
 
 import os, time, ccxt
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
-import signal  # ← AÑADE ESTA LÍNEA
-import sys
 
 from utils_env import load_env, parse_csv, parse_float, parse_int
 from paper_portfolio import PaperPortfolio
@@ -19,12 +17,19 @@ from telegram_notifier import TelegramNotifier
 from state_store import save_state, load_state
 import ta
 
+# Forzar timezone UTC para Railway
+os.environ['TZ'] = 'UTC'
+try:
+    time.tzset()
+except:
+    pass  # Windows no tiene tzset, pero Railway es Linux
+
 STATE_PATH = "paper_state.json"
 
 def clean_tf(s: str) -> str:
     return (s or "").strip().split()[0]
 
-def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
+def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
     for intento in range(3):
         try:
             o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -57,19 +62,7 @@ def get_exchange(ex_id: str, apiKey: str, secret: str):
 def calculate_rsi(df: pd.DataFrame, period: int = 9) -> pd.Series:
     return ta.momentum.RSIIndicator(close=df["close"], window=period).rsi()
 
-# === MANEJO DE SEÑALES PARA CIERRE LIMPIO ===
-def signal_handler(sig, frame):
-    """Guarda el estado y cierra limpiamente cuando Railway lo reinicia"""
-    print(f"[END] Bot detenido por señal {sig}. Guardando estado...")
-    # Aquí guardaríamos el estado si tuviéramos acceso al portfolio
-    # Pero como está dentro de main(), lo manejamos allí
-    sys.exit(0)
-
 def main():
-     # Registrar manejadores de señales al inicio   
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    
     env = load_env(".env")
 
     EXCHANGE_ID = env.get("EXCHANGE","lbank")
@@ -101,8 +94,8 @@ def main():
     ENTRY_COOLDOWN_MIN = parse_int(env.get("ENTRY_COOLDOWN_MIN","1"),1)
     SYMBOL_LOCK_MIN = parse_int(env.get("SYMBOL_LOCK_MIN","3"),3)
     DAILY_LOSS_LIMIT_PCT = parse_float(env.get("DAILY_LOSS_LIMIT_PCT_MODERADO","0.10"),0.10)
-    COOLDOWN_LOSSES = parse_int(env.get("COOLDOWN_LOSSES_MODERADO","5"),5)
-    COOLDOWN_MIN = parse_int(env.get("COOLDOWN_MIN_MODERADO","10"),10)
+    COOLDOWN_LOSSES = parse_int(env.get("COOLDOWN_LOSSES_MODERADO","3"),3)
+    COOLDOWN_MIN = parse_int(env.get("COOLDOWN_MIN_MODERADO","20"),20)
 
     BATCH_SIZE = {"agresivo": parse_int(env.get("BATCH_SIZE_AGRESIVO","4"),4),
                   "moderado": parse_int(env.get("BATCH_SIZE_MODERADO","6"),6),
@@ -148,37 +141,34 @@ def main():
     summary_since = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
     daily_stats = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
     losses_today = 0
-    # Usar UTC consistente para la fecha diaria
-    day_str = datetime.now(timezone.utc).date().isoformat()
+    
+    # ✅ CORRECCIÓN: Inicialización correcta de fecha para Railway
+    current_time = datetime.now(timezone.utc)
+    day_str = current_time.date().isoformat()
     paused_until: Optional[datetime] = None
 
     print(f"[INFO] Zaffex REPLICA: 3 modos | $100 por modo | LTF={LTF}")
     if tg.enabled(): tg.send("🤖 Bot Zaffex (3 modos) iniciado — $100 por modo")
 
-    next_summary_at = datetime.now(timezone.utc).replace(second=0, microsecond=0) + timedelta(minutes=AUTO_SUMMARY_MIN)
+    # ✅ CORRECCIÓN: Inicialización correcta del resumen
+    next_summary_at = current_time.replace(second=0, microsecond=0) + timedelta(minutes=AUTO_SUMMARY_MIN)
 
     try:
         while True:
-            # Siempre usar UTC para now
             now = datetime.now(timezone.utc)
 
-            # Verificar cambio de día en UTC
-            current_utc_date = now.date().isoformat()
-            if current_utc_date != day_str:
-                losses_today = 0
-                day_str = current_utc_date
+            if now.date().isoformat() != day_str:
+                losses_today = 0; day_str = now.date().isoformat()
                 daily_stats = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
 
             if paused_until and now < paused_until:
                 save_state(STATE_PATH, portfolio.equity, portfolio.positions)
-                time.sleep(SLEEP_SEC)
-                continue
+                time.sleep(SLEEP_SEC); continue
             else:
                 paused_until = None
 
             if AUTO_SUMMARY_MIN > 0 and now >= next_summary_at:
-                tr = summary_since["trades"]
-                wr = (summary_since["wins"]/tr*100.0) if tr>0 else 0.0
+                tr = summary_since["trades"]; wr = (summary_since["wins"]/tr*100.0) if tr>0 else 0.0
                 text = ("🕒 Resumen {m}m\nOps: {t} | Win: {w} | Loss: {l}\nWR: {wr:.1f}% | PnL: {p:.6f}\nEquity: {e:.2f}"
                         ).format(m=AUTO_SUMMARY_MIN, t=tr, w=summary_since["wins"], l=summary_since["losses"],
                                  wr=wr, p=summary_since["pnl"], e=portfolio.equity)
@@ -191,7 +181,7 @@ def main():
                 if symbol in symbol_lock_until and now < symbol_lock_until[symbol]:
                     continue
                 try:
-                    df_ltf = fetch_ohlcv_df(ex, symbol, LTF, limit=200)
+                    df_ltf = fetch_ohlcv_df(ex, symbol, LTF, limit=100)
                 except Exception as e:
                     print(f"[WARN] fetch ohlcv {symbol} falló: {e}")
                     if tg.enabled(): tg.send(f"⚠️ Error datos {symbol}: {str(e)[:200]}")
@@ -224,27 +214,23 @@ def main():
                                 reason=status,
                                 equity=portfolio.equity
                             )
-                            summary_since["trades"] += 1
-                            daily_stats["trades"] += 1
+                            summary_since["trades"] += 1; daily_stats["trades"] += 1
                             if pnl >= 0: 
-                                summary_since["wins"] += 1
-                                daily_stats["wins"] += 1
+                                summary_since["wins"] += 1; daily_stats["wins"] += 1
                             else: 
-                                summary_since["losses"] += 1
-                                daily_stats["losses"] += 1
-                                losses_today += 1
-                            summary_since["pnl"] += pnl
-                            daily_stats["pnl"] += pnl
+                                summary_since["losses"] += 1; daily_stats["losses"] += 1; losses_today += 1
+                            summary_since["pnl"] += pnl; daily_stats["pnl"] += pnl
                             if tg.enabled(): 
                                 tg.send(f"✅ <b>{status}</b> {symbol} [{profile}]\nexit={last_px:.2f}\nPnL={pnl:.6f}\nEquity={portfolio.equity:.2f}")
 
-                # freno diario (usar UTC consistente)
+                # ✅ CORRECCIÓN: Validación segura de límites diarios
                 eq_dd = max(0.0, (PAPER_START_BALANCE - portfolio.equity) / PAPER_START_BALANCE)
                 if eq_dd >= DAILY_LOSS_LIMIT_PCT or losses_today >= COOLDOWN_LOSSES:
-                    # CORREGIDO: usar now en UTC para calcular paused_until
-                    paused_until = now + timedelta(minutes=COOLDOWN_MIN)
+                    # Asegurar que COOLDOWN_MIN sea válido
+                    cooldown_minutes = max(1, min(120, COOLDOWN_MIN))
+                    paused_until = now + timedelta(minutes=cooldown_minutes)
                     print(f"[PAUSE] Límite diario. Pausa hasta {paused_until.isoformat()}")
-                    if tg.enabled(): tg.send(f"⏸️ <b>Pausa</b> por pérdidas. Reanuda: {paused_until.isoformat()}")
+                    if tg.enabled(): tg.send(f"⏸️ <b>Pausa</b> por pérdidas. Reanuda en {cooldown_minutes} min")
                     continue
 
                 if len(portfolio.positions) >= DEMO_MAX_POSITIONS:
