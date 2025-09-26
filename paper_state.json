@@ -1,1 +1,4 @@
-{"ts": 1758788230, "equity": 997.7506733541172, "positions": [{"mode": "moderado", "symbol": "BNB/USDT", "side": "long", "entry": 1017.265088, "qty": 0.09830279361754721, "sl": 1013.2675496025363, "tp": 1024.3449007949275, "open_time": 1758786437}]}
+{
+  "equity": 300.0,
+  "positions": []
+}
