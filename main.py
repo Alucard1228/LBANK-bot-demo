@@ -2,7 +2,7 @@
 """
 Bot PAPER replicando Zaffex: 3 modos independientes (agresivo, moderado, conservador)
 Cada modo opera con $100 independientes (saldo total = $300)
-Corregido para Railway (manejo de fechas y pausas)
+Corregido para Railway + Notificaciones de Telegram mejoradas
 """
 
 import os, time, ccxt
@@ -111,6 +111,7 @@ def main():
         ex = get_exchange(EXCHANGE_ID, env.get("API_KEY",""), env.get("API_SECRET",""))
     except Exception as e:
         print(f"[ERR] Exchange init: {e}")
+        if tg.enabled(): tg.send_error(f"Exchange init: {str(e)[:200]}")
         return
 
     portfolio = PaperPortfolio(start_eq=PAPER_START_BALANCE, fee_taker=FEE_TAKER)
@@ -169,11 +170,29 @@ def main():
 
             if AUTO_SUMMARY_MIN > 0 and now >= next_summary_at:
                 tr = summary_since["trades"]; wr = (summary_since["wins"]/tr*100.0) if tr>0 else 0.0
-                text = ("🕒 Resumen {m}m\nOps: {t} | Win: {w} | Loss: {l}\nWR: {wr:.1f}% | PnL: {p:.6f}\nEquity: {e:.2f}"
-                        ).format(m=AUTO_SUMMARY_MIN, t=tr, w=summary_since["wins"], l=summary_since["losses"],
-                                 wr=wr, p=summary_since["pnl"], e=portfolio.equity)
-                print("[SUMMARY]", text.replace("\n"," | "))
-                if tg.enabled(): tg.send(text)
+                print("[SUMMARY]", f"🕒 Resumen {AUTO_SUMMARY_MIN}m | Ops: {tr} | Win: {summary_since['wins']} | Loss: {summary_since['losses']} | WR: {wr:.1f}% | PnL: {summary_since['pnl']:.6f} | Equity: {portfolio.equity:.2f}")
+                
+                if tg.enabled():
+                    # Calcular drawdown diario
+                    daily_dd = max(0.0, (PAPER_START_BALANCE - portfolio.equity) / PAPER_START_BALANCE) * 100
+                    # Contar posiciones por modo para el resumen
+                    mode_counts = {"agresivo": 0, "moderado": 0, "conservador": 0}
+                    for pos in portfolio.positions:
+                        if pos.mode in mode_counts:
+                            mode_counts[pos.mode] += 1
+                    
+                    tg.send_summary(
+                        minutes=AUTO_SUMMARY_MIN,
+                        trades=tr,
+                        wins=summary_since["wins"],
+                        losses=summary_since["losses"],
+                        win_rate=wr,
+                        pnl=summary_since["pnl"],
+                        equity=portfolio.equity,
+                        daily_dd=daily_dd,
+                        by_mode=mode_counts
+                    )
+                
                 summary_since = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
                 next_summary_at = now.replace(second=0, microsecond=0) + timedelta(minutes=AUTO_SUMMARY_MIN)
 
@@ -184,7 +203,7 @@ def main():
                     df_ltf = fetch_ohlcv_df(ex, symbol, LTF, limit=100)
                 except Exception as e:
                     print(f"[WARN] fetch ohlcv {symbol} falló: {e}")
-                    if tg.enabled(): tg.send(f"⚠️ Error datos {symbol}: {str(e)[:200]}")
+                    if tg.enabled(): tg.send_error(f"Error datos {symbol}: {str(e)[:200]}")
                     continue
 
                 ltf_last_close_ts = df_ltf.index[-1]
@@ -220,8 +239,25 @@ def main():
                             else: 
                                 summary_since["losses"] += 1; daily_stats["losses"] += 1; losses_today += 1
                             summary_since["pnl"] += pnl; daily_stats["pnl"] += pnl
+                            
                             if tg.enabled(): 
-                                tg.send(f"✅ <b>{status}</b> {symbol} [{profile}]\nexit={last_px:.2f}\nPnL={pnl:.6f}\nEquity={portfolio.equity:.2f}")
+                                # Calcular PnL en porcentaje
+                                pnl_pct = (pnl / (pos.entry * pos.qty)) * 100 if (pos.entry * pos.qty) > 0 else 0
+                                # Calcular win rate actual
+                                total_ops = summary_since["trades"] + daily_stats["trades"]
+                                current_wr = (summary_since["wins"] + daily_stats["wins"]) / total_ops * 100 if total_ops > 0 else 0
+                                
+                                tg.send_close(
+                                    symbol=symbol,
+                                    mode=profile,
+                                    exit_price=last_px,
+                                    pnl=pnl,
+                                    pnl_pct=pnl_pct,
+                                    reason=status,
+                                    win_rate=current_wr,
+                                    equity=portfolio.equity,
+                                    total_ops=total_ops
+                                )
 
                 # ✅ CORRECCIÓN: Validación segura de límites diarios
                 eq_dd = max(0.0, (PAPER_START_BALANCE - portfolio.equity) / PAPER_START_BALANCE)
@@ -230,7 +266,11 @@ def main():
                     cooldown_minutes = max(1, min(120, COOLDOWN_MIN))
                     paused_until = now + timedelta(minutes=cooldown_minutes)
                     print(f"[PAUSE] Límite diario. Pausa hasta {paused_until.isoformat()}")
-                    if tg.enabled(): tg.send(f"⏸️ <b>Pausa</b> por pérdidas. Reanuda en {cooldown_minutes} min")
+                    if tg.enabled(): 
+                        tg.send_pause(
+                            minutes=cooldown_minutes,
+                            reason="Límite de pérdidas diarias"
+                        )
                     continue
 
                 if len(portfolio.positions) >= DEMO_MAX_POSITIONS:
@@ -278,7 +318,16 @@ def main():
                             last_entry_time[cooldown_key] = now
                             print(f"[OPEN] {symbol} long [{profile}] x{opened} lotes | entry={entry:.2f}")
                             if tg.enabled(): 
-                                tg.send(f"📈 <b>OPEN</b> {symbol} [{profile.upper()}] x{opened} lotes\nentry={entry:.2f}")
+                                tg.send_open(
+                                    symbol=symbol,
+                                    mode=profile,
+                                    lotes=opened,
+                                    entry=entry,
+                                    sl=sl,
+                                    tp=tp,
+                                    equity=portfolio.equity,
+                                    rsi=current_rsi
+                                )
 
                 symbol_lock_until[symbol] = now + timedelta(minutes=SYMBOL_LOCK_MIN)
 
@@ -287,7 +336,10 @@ def main():
 
     except KeyboardInterrupt:
         print(f"[END] Equity final (paper): {portfolio.equity:.2f}")
-        if tg.enabled(): tg.send(f"🛑 Bot detenido. Equity final: {portfolio.equity:.2f}")
+        if tg.enabled(): tg.send(f"🛑 Bot detenido por usuario. Equity final: {portfolio.equity:.2f}")
+    except Exception as e:
+        print(f"[CRITICAL] Error no manejado: {e}")
+        if tg.enabled(): tg.send_error(f"Error crítico: {str(e)[:200]}")
 
 if __name__ == "__main__":
     main()
