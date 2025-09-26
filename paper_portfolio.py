@@ -1,102 +1,56 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+# paper_portfolio.py
 import time
+from typing import List, Optional
 
-@dataclass
 class Position:
-    mode: str
-    symbol: str
-    side: str       # "long"
-    entry: float
-    qty: float
-    sl: float
-    tp: float
-    open_time: int  # epoch seconds
+    def __init__(self, mode: str, symbol: str, side: str, entry: float, qty: float, sl: float, tp: float):
+        self.mode = mode
+        self.symbol = symbol
+        self.side = side
+        self.entry = entry
+        self.qty = qty
+        self.sl = sl
+        self.tp = tp
+        self.open_time = time.time()
 
 class PaperPortfolio:
     def __init__(self, start_eq: float = 1000.0, fee_taker: float = 0.001):
-        self.equity: float = float(start_eq)
-        self.fee_taker: float = float(fee_taker)
-        self.positions: Dict[Tuple[str, str], Position] = {}
-        self.cum_fees: float = 0.0
-        self.cum_pnl: float = 0.0
-
-    def _key(self, mode: str, symbol: str) -> Tuple[str, str]:
-        return (mode, symbol)
-
-    def _notional(self, px: float, qty: float) -> float:
-        return float(px) * float(qty)
+        self.equity = start_eq
+        self.start_eq = start_eq
+        self.fee_taker = fee_taker
+        self.positions: List[Position] = []  # Lista de posiciones
 
     def can_open(self, mode: str, symbol: str) -> bool:
-        return self._key(mode, symbol) not in self.positions
-
-    def open(self, mode: str, symbol: str, side: str,
-             entry: float, qty: float, sl: float, tp: float,
-             reopen: bool = False) -> bool:
-        key = self._key(mode, symbol)
-        if key in self.positions and not reopen:
-            return False
-
-        if reopen:
-            self.positions[key] = Position(
-                mode=mode, symbol=symbol, side=side,
-                entry=float(entry), qty=float(qty),
-                sl=float(sl), tp=float(tp),
-                open_time=int(time.time())
-            )
-            return True
-
-        self.positions[key] = Position(
-            mode=mode, symbol=symbol, side=side,
-            entry=float(entry), qty=float(qty),
-            sl=float(sl), tp=float(tp),
-            open_time=int(time.time())
-        )
-        # si quieres fee en apertura, descomenta:
-        # fee_open = self.fee_taker * self._notional(entry, qty)
-        # self.equity -= fee_open
-        # self.cum_fees += fee_open
+        # Siempre permite abrir (el límite lo maneja main.py)
         return True
 
-    def mark(self, mode: str, symbol: str, last_px: float) -> Optional[str]:
-        key = self._key(mode, symbol)
-        pos = self.positions.get(key)
-        if not pos:
-            return None
-        px = float(last_px)
-        if pos.side == "long":
-            if px >= pos.tp:
-                return "TP"
-            if px <= pos.sl:
-                return "SL"
-        else:
-            if px <= pos.tp:
-                return "TP"
-            if px >= pos.sl:
-                return "SL"
-        return None
+    def open(self, mode: str, symbol: str, side: str, entry: float, qty: float, sl: float, tp: float, reopen=False):
+        if qty <= 0 or entry <= 0:
+            return
+        cost = entry * qty
+        fee = cost * self.fee_taker
+        if not reopen:
+            if self.equity < cost + fee:
+                return
+            self.equity -= (cost + fee)
+        pos = Position(mode, symbol, side, entry, qty, sl, tp)
+        self.positions.append(pos)
 
-    def close(self, mode: str, symbol: str, exit_px: float):
-        key = self._key(mode, symbol)
-        pos = self.positions.get(key)
-        if not pos:
-            return 0.0, 0.0, None
+    def close_position(self, position: Position, exit_price: float):
+        """Cierra una posición individual y devuelve pnl y fee"""
+        if position.side != "long":
+            return 0.0, 0.0
+        proceeds = exit_price * position.qty
+        fee = proceeds * self.fee_taker
+        pnl = proceeds - fee - (position.entry * position.qty)
+        self.equity += (proceeds - fee)
+        return pnl, fee
 
-        px = float(exit_px)
-        if pos.side == "long":
-            pnl = (px - pos.entry) * pos.qty
-        else:
-            pnl = (pos.entry - px) * pos.qty
+    def get_positions(self, mode: str, symbol: str) -> list:
+        """Devuelve todas las posiciones abiertas para (modo, símbolo)"""
+        return [p for p in self.positions if p.mode == mode and p.symbol == symbol]
 
-        fee_close = self.fee_taker * self._notional(px, pos.qty)
-        fee_total = fee_close  # si cobraste fee en apertura, súmala aquí
-        pnl_net = pnl - fee_total
-
-        self.equity += pnl_net
-        self.cum_pnl += pnl
-        self.cum_fees += fee_total
-
-        del self.positions[key]
-        return float(pnl_net), float(fee_total), pos
+    def remove_position(self, position: Position):
+        """Elimina una posición de la lista"""
+        if position in self.positions:
+            self.positions.remove(position)
