@@ -64,6 +64,9 @@ def calculate_rsi(df: pd.DataFrame, period: int = 9) -> pd.Series:
 
 def main():
     env = load_env(".env")
+    
+    # === FORZAR INICIO FRESCO (CAMBIA A False DESPUÉS DEL PRIMER ÉXITO) ===
+    FORCE_FRESH_START = True
 
     EXCHANGE_ID = env.get("EXCHANGE","lbank")
     SYMBOLS = ["btc_usdt", "eth_usdt"]
@@ -121,27 +124,31 @@ def main():
             tg.send_error(f"Exchange init: {str(e)[:200]}")
         return
 
+    # === INICIALIZACIÓN FRESCA (sin cargar estado guardado) ===
     portfolio = PaperPortfolio(start_eq=PAPER_START_BALANCE, fee_taker=FEE_TAKER)
     logger = TradeLogger(csv_path=CSV_PATH)
-
-    st = load_state(STATE_PATH)
-    if st:
-        try:
-            portfolio.equity = float(st.get("equity", portfolio.equity))
-            for pos_data in st.get("positions", []):
-                portfolio.open(
-                    pos_data["mode"], 
-                    pos_data["symbol"], 
-                    pos_data["side"],
-                    pos_data["entry"], 
-                    pos_data["qty"], 
-                    pos_data["sl"], 
-                    pos_data["tp"],
-                    reopen=True
-                )
-            print(f"[STATE] Restaurado: equity={portfolio.equity:.2f} | open={len(portfolio.positions)}")
-        except Exception as e:
-            print(f"[STATE] No se pudo restaurar: {e}")
+    
+    if not FORCE_FRESH_START:
+        st = load_state(STATE_PATH)
+        if st:
+            try:
+                portfolio.equity = float(st.get("equity", portfolio.equity))
+                for pos_data in st.get("positions", []):
+                    portfolio.open(
+                        pos_data["mode"], 
+                        pos_data["symbol"], 
+                        pos_data["side"],
+                        pos_data["entry"], 
+                        pos_data["qty"], 
+                        pos_data["sl"], 
+                        pos_data["tp"],
+                        reopen=True
+                    )
+                print(f"[STATE] Restaurado: equity={portfolio.equity:.2f} | open={len(portfolio.positions)}")
+            except Exception as e:
+                print(f"[STATE] No se pudo restaurar: {e}")
+    else:
+        print(f"[FRESH] Inicio fresco con equity={PAPER_START_BALANCE}")
 
     last_ltf_close: Dict[str, Optional[pd.Timestamp]] = {s: None for s in SYMBOLS}
     last_entry_time: Dict[str, datetime] = {}
