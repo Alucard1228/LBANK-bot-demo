@@ -2,6 +2,7 @@
 """
 Bot PAPER replicando Zaffex: 3 modos independientes (agresivo, moderado, conservador)
 Cada modo opera con $100 independientes (saldo total = $300)
+Corregido para manejo consistente de UTC
 """
 
 import os, time, ccxt
@@ -21,7 +22,7 @@ STATE_PATH = "paper_state.json"
 def clean_tf(s: str) -> str:
     return (s or "").strip().split()[0]
 
-def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
+def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
     for intento in range(3):
         try:
             o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -60,7 +61,7 @@ def main():
     EXCHANGE_ID = env.get("EXCHANGE","lbank")
     SYMBOLS = ["btc_usdt", "eth_usdt"]
 
-    LTF = clean_tf(env.get("TIMEFRAME_LTF","5m"))
+    LTF = clean_tf(env.get("TIMEFRAME_LTF","1m"))
 
     RISK   = {"agresivo": parse_float(env.get("RISK_AGRESIVO","1.0"),1.0),
               "moderado": parse_float(env.get("RISK_MODERADO","1.0"),1.0),
@@ -86,8 +87,8 @@ def main():
     ENTRY_COOLDOWN_MIN = parse_int(env.get("ENTRY_COOLDOWN_MIN","1"),1)
     SYMBOL_LOCK_MIN = parse_int(env.get("SYMBOL_LOCK_MIN","3"),3)
     DAILY_LOSS_LIMIT_PCT = parse_float(env.get("DAILY_LOSS_LIMIT_PCT_MODERADO","0.10"),0.10)
-    COOLDOWN_LOSSES = parse_int(env.get("COOLDOWN_LOSSES_MODERADO","3"),3)
-    COOLDOWN_MIN = parse_int(env.get("COOLDOWN_MIN_MODERADO","20"),20)
+    COOLDOWN_LOSSES = parse_int(env.get("COOLDOWN_LOSSES_MODERADO","5"),5)
+    COOLDOWN_MIN = parse_int(env.get("COOLDOWN_MIN_MODERADO","10"),10)
 
     BATCH_SIZE = {"agresivo": parse_int(env.get("BATCH_SIZE_AGRESIVO","4"),4),
                   "moderado": parse_int(env.get("BATCH_SIZE_MODERADO","6"),6),
@@ -133,6 +134,7 @@ def main():
     summary_since = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
     daily_stats = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
     losses_today = 0
+    # Usar UTC consistente para la fecha diaria
     day_str = datetime.now(timezone.utc).date().isoformat()
     paused_until: Optional[datetime] = None
 
@@ -143,20 +145,26 @@ def main():
 
     try:
         while True:
+            # Siempre usar UTC para now
             now = datetime.now(timezone.utc)
 
-            if now.date().isoformat() != day_str:
-                losses_today = 0; day_str = now.date().isoformat()
+            # Verificar cambio de día en UTC
+            current_utc_date = now.date().isoformat()
+            if current_utc_date != day_str:
+                losses_today = 0
+                day_str = current_utc_date
                 daily_stats = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
 
             if paused_until and now < paused_until:
                 save_state(STATE_PATH, portfolio.equity, portfolio.positions)
-                time.sleep(SLEEP_SEC); continue
+                time.sleep(SLEEP_SEC)
+                continue
             else:
                 paused_until = None
 
             if AUTO_SUMMARY_MIN > 0 and now >= next_summary_at:
-                tr = summary_since["trades"]; wr = (summary_since["wins"]/tr*100.0) if tr>0 else 0.0
+                tr = summary_since["trades"]
+                wr = (summary_since["wins"]/tr*100.0) if tr>0 else 0.0
                 text = ("🕒 Resumen {m}m\nOps: {t} | Win: {w} | Loss: {l}\nWR: {wr:.1f}% | PnL: {p:.6f}\nEquity: {e:.2f}"
                         ).format(m=AUTO_SUMMARY_MIN, t=tr, w=summary_since["wins"], l=summary_since["losses"],
                                  wr=wr, p=summary_since["pnl"], e=portfolio.equity)
@@ -169,7 +177,7 @@ def main():
                 if symbol in symbol_lock_until and now < symbol_lock_until[symbol]:
                     continue
                 try:
-                    df_ltf = fetch_ohlcv_df(ex, symbol, LTF, limit=100)
+                    df_ltf = fetch_ohlcv_df(ex, symbol, LTF, limit=200)
                 except Exception as e:
                     print(f"[WARN] fetch ohlcv {symbol} falló: {e}")
                     if tg.enabled(): tg.send(f"⚠️ Error datos {symbol}: {str(e)[:200]}")
@@ -202,18 +210,24 @@ def main():
                                 reason=status,
                                 equity=portfolio.equity
                             )
-                            summary_since["trades"] += 1; daily_stats["trades"] += 1
+                            summary_since["trades"] += 1
+                            daily_stats["trades"] += 1
                             if pnl >= 0: 
-                                summary_since["wins"] += 1; daily_stats["wins"] += 1
+                                summary_since["wins"] += 1
+                                daily_stats["wins"] += 1
                             else: 
-                                summary_since["losses"] += 1; daily_stats["losses"] += 1; losses_today += 1
-                            summary_since["pnl"] += pnl; daily_stats["pnl"] += pnl
+                                summary_since["losses"] += 1
+                                daily_stats["losses"] += 1
+                                losses_today += 1
+                            summary_since["pnl"] += pnl
+                            daily_stats["pnl"] += pnl
                             if tg.enabled(): 
                                 tg.send(f"✅ <b>{status}</b> {symbol} [{profile}]\nexit={last_px:.2f}\nPnL={pnl:.6f}\nEquity={portfolio.equity:.2f}")
 
-                # freno diario
+                # freno diario (usar UTC consistente)
                 eq_dd = max(0.0, (PAPER_START_BALANCE - portfolio.equity) / PAPER_START_BALANCE)
                 if eq_dd >= DAILY_LOSS_LIMIT_PCT or losses_today >= COOLDOWN_LOSSES:
+                    # CORREGIDO: usar now en UTC para calcular paused_until
                     paused_until = now + timedelta(minutes=COOLDOWN_MIN)
                     print(f"[PAUSE] Límite diario. Pausa hasta {paused_until.isoformat()}")
                     if tg.enabled(): tg.send(f"⏸️ <b>Pausa</b> por pérdidas. Reanuda: {paused_until.isoformat()}")
@@ -233,7 +247,6 @@ def main():
                         continue
 
                     if current_rsi < RSI_BUY_THRESHOLD:
-                        # Cada modo opera con $100
                         capital_por_modo = 100.0
                         batch_size = BATCH_SIZE[profile]
                         entry = last_px * (1 + SPREAD_BPS)
