@@ -1,1 +1,1 @@
-ts,event,id,symbol,mode,side,entry_px,sl_px,qty,exit_px,pnl,pnl_r,reason,equity
+id,timestamp,type,symbol,mode,side,entry_px,exit_px,qty,pnl,r,reason,equity
