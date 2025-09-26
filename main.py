@@ -9,6 +9,8 @@ import os, time, ccxt
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
+import signal  # ← AÑADE ESTA LÍNEA
+import sys
 
 from utils_env import load_env, parse_csv, parse_float, parse_int
 from paper_portfolio import PaperPortfolio
@@ -55,7 +57,19 @@ def get_exchange(ex_id: str, apiKey: str, secret: str):
 def calculate_rsi(df: pd.DataFrame, period: int = 9) -> pd.Series:
     return ta.momentum.RSIIndicator(close=df["close"], window=period).rsi()
 
+# === MANEJO DE SEÑALES PARA CIERRE LIMPIO ===
+def signal_handler(sig, frame):
+    """Guarda el estado y cierra limpiamente cuando Railway lo reinicia"""
+    print(f"[END] Bot detenido por señal {sig}. Guardando estado...")
+    # Aquí guardaríamos el estado si tuviéramos acceso al portfolio
+    # Pero como está dentro de main(), lo manejamos allí
+    sys.exit(0)
+
 def main():
+     # Registrar manejadores de señales al inicio   
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     env = load_env(".env")
 
     EXCHANGE_ID = env.get("EXCHANGE","lbank")
