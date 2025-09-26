@@ -2,7 +2,7 @@
 """
 Bot PAPER replicando Zaffex: 3 modos independientes (agresivo, moderado, conservador)
 Cada modo opera con $100 independientes (saldo total = $300)
-Corregido para Railway + Notificaciones de Telegram mejoradas
+Corregido para Railway + Depuración de Telegram
 """
 
 import os, time, ccxt
@@ -106,12 +106,23 @@ def main():
     CSV_PATH = env.get("CSV_PATH","operaciones_zaffex.csv")
     PAPER_START_BALANCE = parse_float(env.get("PAPER_START_BALANCE","300"),300.0)
 
+    # ✅ PASO 5: Inicialización con logs de depuración
     tg = TelegramNotifier(env.get("TELEGRAM_TOKEN"), env.get("TELEGRAM_ALLOWED_IDS"))
+    print(f"[DEBUG] Telegram enabled: {tg.enabled()}")
+    print(f"[DEBUG] TELEGRAM_TOKEN: {'✓' if env.get('TELEGRAM_TOKEN') else '✗'}")
+    print(f"[DEBUG] TELEGRAM_ALLOWED_IDS: {env.get('TELEGRAM_ALLOWED_IDS', 'NO_CONFIGURADO')}")
+    
+    if tg.enabled():
+        tg.send("🤖 Bot Zaffex iniciado - Prueba de conexión Telegram ✅")
+    else:
+        print("[DEBUG] Telegram deshabilitado - verifique variables en Railway")
+
     try:
         ex = get_exchange(EXCHANGE_ID, env.get("API_KEY",""), env.get("API_SECRET",""))
     except Exception as e:
         print(f"[ERR] Exchange init: {e}")
-        if tg.enabled(): tg.send_error(f"Exchange init: {str(e)[:200]}")
+        if tg.enabled(): 
+            tg.send_error(f"Exchange init: {str(e)[:200]}")
         return
 
     portfolio = PaperPortfolio(start_eq=PAPER_START_BALANCE, fee_taker=FEE_TAKER)
@@ -149,7 +160,8 @@ def main():
     paused_until: Optional[datetime] = None
 
     print(f"[INFO] Zaffex REPLICA: 3 modos | $100 por modo | LTF={LTF}")
-    if tg.enabled(): tg.send("🤖 Bot Zaffex (3 modos) iniciado — $100 por modo")
+    if tg.enabled() and not tg.enabled():  # Solo si no se envió arriba
+        tg.send("🤖 Bot Zaffex (3 modos) iniciado — $100 por modo")
 
     # ✅ CORRECCIÓN: Inicialización correcta del resumen
     next_summary_at = current_time.replace(second=0, microsecond=0) + timedelta(minutes=AUTO_SUMMARY_MIN)
