@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Bot PAPER replicando Zaffex: 3 modos independientes (agresivo, moderado, conservador)
-Cada modo opera con $100 independientes (saldo total = $300)
-Corregido para Railway + Depuración de Telegram
+Configuración REALISTA que imita al bot original Zaffex
+Saldo: $235, operaciones pequeñas, sin pausas innecesarias
 """
 
 import os, time, ccxt
@@ -70,9 +70,9 @@ def main():
 
     LTF = clean_tf(env.get("TIMEFRAME_LTF","1m"))
 
-    RISK   = {"agresivo": parse_float(env.get("RISK_AGRESIVO","1.0"),1.0),
-              "moderado": parse_float(env.get("RISK_MODERADO","1.0"),1.0),
-              "conservador": parse_float(env.get("RISK_CONSERVADOR","1.0"),1.0)}
+    RISK   = {"agresivo": parse_float(env.get("RISK_AGRESIVO","0.20"),0.20),
+              "moderado": parse_float(env.get("RISK_MODERADO","0.15"),0.15),
+              "conservador": parse_float(env.get("RISK_CONSERVADOR","0.10"),0.10)}
     
     TP_PCT = {"agresivo": parse_float(env.get("TP_PCT_AGRESIVO","1.0"),1.0),
               "moderado": parse_float(env.get("TP_PCT_MODERADO","1.0"),1.0),
@@ -82,9 +82,9 @@ def main():
               "moderado": parse_float(env.get("SL_PCT_MODERADO","1.2"),1.2),
               "conservador": parse_float(env.get("SL_PCT_CONSERVADOR","1.2"),1.2)}
 
-    DEMO_MAX_TRADE_USDT = parse_float(env.get("DEMO_MAX_TRADE_USDT","100"),100.0)
-    DEMO_MAX_POSITIONS  = parse_int(env.get("DEMO_MAX_POSITIONS","24"),24)
-    MIN_NOTIONAL_USDT   = parse_float(env.get("MIN_NOTIONAL_USDT","5"),5.0)
+    DEMO_MAX_TRADE_USDT = parse_float(env.get("DEMO_MAX_TRADE_USDT","50"),50.0)
+    DEMO_MAX_POSITIONS  = parse_int(env.get("DEMO_MAX_POSITIONS","12"),12)
+    MIN_NOTIONAL_USDT   = parse_float(env.get("MIN_NOTIONAL_USDT","0.5"),0.5)
     FEE_TAKER = parse_float(env.get("FEE_TAKER","0.001"),0.001)
     SPREAD_BPS= parse_float(env.get("SPREAD_BPS","0.0003"),0.0003)
 
@@ -93,29 +93,25 @@ def main():
 
     ENTRY_COOLDOWN_MIN = parse_int(env.get("ENTRY_COOLDOWN_MIN","1"),1)
     SYMBOL_LOCK_MIN = parse_int(env.get("SYMBOL_LOCK_MIN","3"),3)
-    DAILY_LOSS_LIMIT_PCT = parse_float(env.get("DAILY_LOSS_LIMIT_PCT_MODERADO","0.10"),0.10)
-    COOLDOWN_LOSSES = parse_int(env.get("COOLDOWN_LOSSES_MODERADO","3"),3)
-    COOLDOWN_MIN = parse_int(env.get("COOLDOWN_MIN_MODERADO","20"),20)
+    DAILY_LOSS_LIMIT_PCT = parse_float(env.get("DAILY_LOSS_LIMIT_PCT_MODERADO","0.05"),0.05)
+    COOLDOWN_LOSSES = parse_int(env.get("COOLDOWN_LOSSES_MODERADO","2"),2)
+    COOLDOWN_MIN = parse_int(env.get("COOLDOWN_MIN_MODERADO","30"),30)
 
-    BATCH_SIZE = {"agresivo": parse_int(env.get("BATCH_SIZE_AGRESIVO","4"),4),
-                  "moderado": parse_int(env.get("BATCH_SIZE_MODERADO","6"),6),
-                  "conservador": parse_int(env.get("BATCH_SIZE_CONSERVADOR","8"),8)}
+    BATCH_SIZE = {"agresivo": parse_int(env.get("BATCH_SIZE_AGRESIVO","3"),3),
+                  "moderado": parse_int(env.get("BATCH_SIZE_MODERADO","4"),4),
+                  "conservador": parse_int(env.get("BATCH_SIZE_CONSERVADOR","5"),5)}
 
     AUTO_SUMMARY_MIN = parse_int(env.get("AUTO_SUMMARY_MIN","15"),15)
     SLEEP_SEC = parse_int(env.get("SLEEP_SEC","2"),2)
     CSV_PATH = env.get("CSV_PATH","operaciones_zaffex.csv")
-    PAPER_START_BALANCE = parse_float(env.get("PAPER_START_BALANCE","300"),300.0)
+    PAPER_START_BALANCE = parse_float(env.get("PAPER_START_BALANCE","235"),235.0)
 
-    # ✅ PASO 5: Inicialización con logs de depuración
+    # Inicialización de Telegram
     tg = TelegramNotifier(env.get("TELEGRAM_TOKEN"), env.get("TELEGRAM_ALLOWED_IDS"))
-    print(f"[DEBUG] Telegram enabled: {tg.enabled()}")
-    print(f"[DEBUG] TELEGRAM_TOKEN: {'✓' if env.get('TELEGRAM_TOKEN') else '✗'}")
-    print(f"[DEBUG] TELEGRAM_ALLOWED_IDS: {env.get('TELEGRAM_ALLOWED_IDS', 'NO_CONFIGURADO')}")
-    
     if tg.enabled():
-        tg.send("🤖 Bot Zaffex iniciado - Prueba de conexión Telegram ✅")
+        tg.send("🤖 Bot Zaffex REALISTA iniciado — Saldo: $235")
     else:
-        print("[DEBUG] Telegram deshabilitado - verifique variables en Railway")
+        print("[DEBUG] Telegram deshabilitado")
 
     try:
         ex = get_exchange(EXCHANGE_ID, env.get("API_KEY",""), env.get("API_SECRET",""))
@@ -154,16 +150,13 @@ def main():
     daily_stats = {"trades":0,"wins":0,"losses":0,"pnl":0.0}
     losses_today = 0
     
-    # ✅ CORRECCIÓN: Inicialización correcta de fecha para Railway
     current_time = datetime.now(timezone.utc)
     day_str = current_time.date().isoformat()
     paused_until: Optional[datetime] = None
 
-    print(f"[INFO] Zaffex REPLICA: 3 modos | $100 por modo | LTF={LTF}")
-    if tg.enabled() and not tg.enabled():  # Solo si no se envió arriba
-        tg.send("🤖 Bot Zaffex (3 modos) iniciado — $100 por modo")
+    print(f"[INFO] Zaffex REALISTA: Saldo ${PAPER_START_BALANCE} | LTF={LTF}")
+    print(f"[INFO] Riesgo: Agresivo={RISK['agresivo']}, Moderado={RISK['moderado']}, Conservador={RISK['conservador']}")
 
-    # ✅ CORRECCIÓN: Inicialización correcta del resumen
     next_summary_at = current_time.replace(second=0, microsecond=0) + timedelta(minutes=AUTO_SUMMARY_MIN)
 
     try:
@@ -185,9 +178,7 @@ def main():
                 print("[SUMMARY]", f"🕒 Resumen {AUTO_SUMMARY_MIN}m | Ops: {tr} | Win: {summary_since['wins']} | Loss: {summary_since['losses']} | WR: {wr:.1f}% | PnL: {summary_since['pnl']:.6f} | Equity: {portfolio.equity:.2f}")
                 
                 if tg.enabled():
-                    # Calcular drawdown diario
                     daily_dd = max(0.0, (PAPER_START_BALANCE - portfolio.equity) / PAPER_START_BALANCE) * 100
-                    # Contar posiciones por modo para el resumen
                     mode_counts = {"agresivo": 0, "moderado": 0, "conservador": 0}
                     for pos in portfolio.positions:
                         if pos.mode in mode_counts:
@@ -253,9 +244,7 @@ def main():
                             summary_since["pnl"] += pnl; daily_stats["pnl"] += pnl
                             
                             if tg.enabled(): 
-                                # Calcular PnL en porcentaje
                                 pnl_pct = (pnl / (pos.entry * pos.qty)) * 100 if (pos.entry * pos.qty) > 0 else 0
-                                # Calcular win rate actual
                                 total_ops = summary_since["trades"] + daily_stats["trades"]
                                 current_wr = (summary_since["wins"] + daily_stats["wins"]) / total_ops * 100 if total_ops > 0 else 0
                                 
@@ -271,17 +260,16 @@ def main():
                                     total_ops=total_ops
                                 )
 
-                # ✅ CORRECCIÓN: Validación segura de límites diarios
+                # === Verificación de límites diarios ===
                 eq_dd = max(0.0, (PAPER_START_BALANCE - portfolio.equity) / PAPER_START_BALANCE)
                 if eq_dd >= DAILY_LOSS_LIMIT_PCT or losses_today >= COOLDOWN_LOSSES:
-                    # Asegurar que COOLDOWN_MIN sea válido
                     cooldown_minutes = max(1, min(120, COOLDOWN_MIN))
                     paused_until = now + timedelta(minutes=cooldown_minutes)
-                    print(f"[PAUSE] Límite diario. Pausa hasta {paused_until.isoformat()}")
+                    print(f"[PAUSE] Límite diario (${DAILY_LOSS_LIMIT_PCT*PAPER_START_BALANCE:.2f}). Pausa {cooldown_minutes} min hasta {paused_until.isoformat()}")
                     if tg.enabled(): 
                         tg.send_pause(
                             minutes=cooldown_minutes,
-                            reason="Límite de pérdidas diarias"
+                            reason=f"Límite pérdidas diarias (${DAILY_LOSS_LIMIT_PCT*PAPER_START_BALANCE:.2f})"
                         )
                     continue
 
@@ -299,19 +287,31 @@ def main():
                         continue
 
                     if current_rsi < RSI_BUY_THRESHOLD:
-                        capital_por_modo = 100.0
+                        # Calcular capital de riesgo realista
+                        risk_frac = RISK[profile]
+                        total_risk_capital = portfolio.equity * risk_frac
                         batch_size = BATCH_SIZE[profile]
                         entry = last_px * (1 + SPREAD_BPS)
                         tp_pct = TP_PCT[profile] / 100.0
                         sl_pct = SL_PCT[profile] / 100.0
-                        notional_per_lot = capital_por_modo / batch_size
                         
+                        # Tamaño por lote
+                        notional_per_lot = total_risk_capital / batch_size
+                        
+                        # Aplicar límites
                         if notional_per_lot < MIN_NOTIONAL_USDT:
                             notional_per_lot = MIN_NOTIONAL_USDT
-                        if notional_per_lot > DEMO_MAX_TRADE_USDT / batch_size:
-                            notional_per_lot = DEMO_MAX_TRADE_USDT / batch_size
+                        max_per_lot = DEMO_MAX_TRADE_USDT / batch_size
+                        if notional_per_lot > max_per_lot:
+                            notional_per_lot = max_per_lot
                         
                         qty_per_lot = notional_per_lot / entry
+                        
+                        # Ajustar batch size si excede límites
+                        total_notional = notional_per_lot * batch_size
+                        if total_notional > DEMO_MAX_TRADE_USDT:
+                            batch_size = int(DEMO_MAX_TRADE_USDT / notional_per_lot)
+                            batch_size = max(1, min(batch_size, BATCH_SIZE[profile]))
                         
                         opened = 0
                         for i in range(batch_size):
@@ -328,7 +328,7 @@ def main():
                         
                         if opened > 0:
                             last_entry_time[cooldown_key] = now
-                            print(f"[OPEN] {symbol} long [{profile}] x{opened} lotes | entry={entry:.2f}")
+                            print(f"[OPEN] {symbol} long [{profile}] x{opened} lotes | entry={entry:.2f} | lot=${notional_per_lot:.2f}")
                             if tg.enabled(): 
                                 tg.send_open(
                                     symbol=symbol,
@@ -348,9 +348,9 @@ def main():
 
     except KeyboardInterrupt:
         print(f"[END] Equity final (paper): {portfolio.equity:.2f}")
-        if tg.enabled(): tg.send(f"🛑 Bot detenido por usuario. Equity final: {portfolio.equity:.2f}")
+        if tg.enabled(): tg.send(f"🛑 Bot detenido. Equity final: {portfolio.equity:.2f}")
     except Exception as e:
-        print(f"[CRITICAL] Error no manejado: {e}")
+        print(f"[CRITICAL] Error: {e}")
         if tg.enabled(): tg.send_error(f"Error crítico: {str(e)[:200]}")
 
 if __name__ == "__main__":
