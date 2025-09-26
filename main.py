@@ -1,9 +1,11 @@
-# main.py - VERSIÓN MÍNIMA GARANTIZADA
+# main.py - VERSIÓN OPTIMIZADA PARA RAILWAY
 import time
 import os
+import sys
 from datetime import datetime, timezone
 
-# Forzar UTC
+# Forzar UTF-8 y UTC
+os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['TZ'] = 'UTC'
 try:
     time.tzset()
@@ -11,23 +13,37 @@ except:
     pass
 
 def main():
-    print("🤖 Bot Zaffex iniciado - Ejecutando continuamente...")
+    print("🤖 Bot Zaffex - Versión Optimizada Railway")
+    print("[INFO] Iniciando en modo Background Worker...")
     
-    # Simular inicialización
-    print("[TELEGRAM] ✅ Bot iniciado en Telegram")
-    print("[INFO] Saldo: $235.0 | Modo: Background Worker")
+    # Reducir buffer de salida para ver logs en tiempo real
+    sys.stdout.reconfigure(line_buffering=True)
     
-    # ✅ BUCLE INFINITO QUE NUNCA TERMINA
     counter = 0
     while True:
-        counter += 1
-        current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[DEBUG] Ciclo {counter} - {current_time} - Esperando señales...")
-        
-        # Aquí iría tu lógica real de trading
-        # Pero lo importante es que NUNCA sale del bucle
-        
-        time.sleep(2)  # Esperar 2 segundos
+        try:
+            counter += 1
+            current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[LOOP] {counter} | {current_time}")
+            
+            # Simular trabajo ligero
+            time.sleep(2)
+            
+            # Forzar liberación de memoria cada 100 ciclos
+            if counter % 100 == 0:
+                import gc
+                gc.collect()
+                print("[MEMORY] Garbage collection executed")
+                
+        except KeyboardInterrupt:
+            # Ignorar interrupciones (Railway las envía durante reinicios)
+            print("[INFO] Ignorando señal de interrupción...")
+            continue
+        except Exception as e:
+            # Manejar cualquier error y continuar
+            print(f"[ERROR] {str(e)[:100]} - Continuando...")
+            time.sleep(5)
+            continue
 
 if __name__ == "__main__":
     main()
